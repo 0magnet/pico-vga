@@ -1,4 +1,4 @@
-// VGA 640x480@60Hz - exact timing from pico-extras vga_modes.c
+// VGA 640x480@60Hz with timing measurement
 package main
 
 import (
@@ -27,35 +27,26 @@ var (
 
 var dummy volatile.Register32
 
-// VGA 640x480@60Hz timing from pico-extras:
-// Pixel clock: 25MHz, System clock: 125MHz (5x ratio)
-// H: active=640, front_porch=16, sync=96, back_porch=48, total=800
-// V: active=480, front_porch=10, sync=2, back_porch=33, total=525
-// Polarity: negative (sync pulse is LOW)
-//
-// At 125MHz:
-// H_total = 800 * 5 = 4000 cycles
-// H_HIGH = 704 * 5 = 3520 cycles (active + front + back porch)
-// H_LOW = 96 * 5 = 480 cycles (sync pulse)
-//
-// Loop calibration: each iteration with volatile write ≈ 5-6 cycles
-// HIGH loops: 3520 / 5 = 704
-// LOW loops: 480 / 5 = 96
-
+// Tunable parameters
+// Target: HSYNC = 31.468 kHz, VSYNC = 59.94 Hz
+// At 31.468 kHz, one line = 31.778 us
+// At 59.94 Hz, one frame = 16.683 ms
 const (
-	hHighLoops = 670  // Was 704, trying ~5% faster
-	hLowLoops  = 91   // Was 96, keeping ratio
+	hHighLoops = 704  // Back to original
+	hLowLoops  = 96
 	vTotal     = 525
-	vSyncStart = 490 // 480 active + 10 front porch
-	vSyncEnd   = 492 // vSyncStart + 2 sync lines
+	vSyncStart = 490
+	vSyncEnd   = 492
 )
 
 func main() {
 	time.Sleep(3 * time.Second)
 
-	println("=== VGA 640x480@60Hz - Exact pico-extras timing ===")
-	println("H: 670 HIGH loops, 91 LOW loops")
-	println("V: 525 total, sync at lines 490-491")
+	println("=== VGA with Timing Measurement ===")
+	println("H loops:", hHighLoops, "/", hLowLoops)
+	println("Target: 31.468 kHz HSYNC, 59.94 Hz VSYNC")
+	println("Target frame time: 16683 us")
+	println("")
 
 	led := machine.LED
 	led.Configure(machine.PinConfig{Mode: machine.PinOutput})
@@ -86,21 +77,21 @@ func main() {
 	hsyncMask := uint32(1 << 16)
 	vsyncMask := uint32(1 << 17)
 
-	println("Starting VGA signal generation...")
+	println("Starting - will measure timing...")
 
 	frameCount := uint32(0)
+	startTime := time.Now()
 
 	for {
 		// Generate one frame (525 lines)
 		for line := 0; line < vTotal; line++ {
-			// VSYNC control: LOW during sync lines
 			if line == vSyncStart {
 				gpioOutClr.Set(vsyncMask)
 			} else if line == vSyncEnd {
 				gpioOutSet.Set(vsyncMask)
 			}
 
-			// HSYNC HIGH period (active + front porch + back porch)
+			// HSYNC HIGH
 			for i := 0; i < hHighLoops; i++ {
 				dummy.Set(uint32(i))
 			}
@@ -115,12 +106,24 @@ func main() {
 
 		frameCount++
 
+		// Every 60 frames, measure and report timing
 		if frameCount%60 == 0 {
-			led.Low()
-		}
-		if frameCount%120 == 0 {
-			led.High()
-			println("Frame:", frameCount)
+			elapsed := time.Since(startTime)
+			elapsedUs := elapsed.Microseconds()
+			frameTimeUs := elapsedUs / int64(frameCount)
+			hsyncHz := int64(1000000) * int64(frameCount) * int64(vTotal) / elapsedUs
+			vsyncHz := int64(1000000) * int64(frameCount) * 100 / elapsedUs // x100 for 2 decimal places
+
+			println("Frames:", frameCount,
+				"FrameTime:", frameTimeUs, "us",
+				"HSYNC:", hsyncHz, "Hz",
+				"VSYNC:", vsyncHz/100, ".", vsyncHz%100, "Hz")
+
+			if frameCount%120 == 0 {
+				led.High()
+			} else {
+				led.Low()
+			}
 		}
 	}
 }
