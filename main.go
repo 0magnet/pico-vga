@@ -33,7 +33,7 @@ var dummy volatile.Register32
 // At 59.94 Hz, one frame = 16.683 ms
 const (
 	hHighLoops = 704  // Keep 704 stable
-	hLowLoops  = 89   // Target ~31468 Hz
+	hLowLoops  = 88   // Target 31468 Hz (was 89→31432)
 	vTotal     = 525
 	vSyncStart = 490
 	vSyncEnd   = 492
