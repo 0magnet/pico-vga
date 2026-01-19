@@ -32,8 +32,8 @@ var dummy volatile.Register32
 // At 31.468 kHz, one line = 31.778 us
 // At 59.94 Hz, one frame = 16.683 ms
 const (
-	hHighLoops = 704  // Keep 704 stable
-	hLowLoops  = 88   // Target 31468 Hz (was 89→31432)
+	hHighLoops = 680  // Must stay at 680 (magic threshold)
+	hLowLoops  = 90   // Increase to slow down from 31557→31468 Hz
 	vTotal     = 525
 	vSyncStart = 490
 	vSyncEnd   = 492
@@ -96,10 +96,11 @@ func main() {
 				dummy.Set(uint32(i))
 			}
 
-			// HSYNC LOW (sync pulse)
+			// HSYNC LOW (sync pulse) - extra delay to widen pulse
 			gpioOutClr.Set(hsyncMask)
 			for i := 0; i < hLowLoops; i++ {
 				dummy.Set(uint32(i))
+				dummy.Set(uint32(i)) // Extra delay to widen sync pulse
 			}
 			gpioOutSet.Set(hsyncMask)
 		}
