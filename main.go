@@ -43,8 +43,8 @@ var dummy volatile.Register32
 // LOW loops: 480 / 5 = 96
 
 const (
-	hHighLoops = 704
-	hLowLoops  = 96
+	hHighLoops = 670  // Was 704, trying ~5% faster
+	hLowLoops  = 91   // Was 96, keeping ratio
 	vTotal     = 525
 	vSyncStart = 490 // 480 active + 10 front porch
 	vSyncEnd   = 492 // vSyncStart + 2 sync lines
@@ -54,7 +54,7 @@ func main() {
 	time.Sleep(3 * time.Second)
 
 	println("=== VGA 640x480@60Hz - Exact pico-extras timing ===")
-	println("H: 704 HIGH loops, 96 LOW loops")
+	println("H: 670 HIGH loops, 91 LOW loops")
 	println("V: 525 total, sync at lines 490-491")
 
 	led := machine.LED
