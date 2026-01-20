@@ -9,6 +9,29 @@ Port GVga library and pico-extras scanvideo library to TinyGo for Raspberry Pi P
 - RGB565: GPIO0-15
 - Target: 640x480@60Hz VGA (31.468 kHz HSYNC, 60 Hz VSYNC)
 
+## Host Setup (Linux)
+
+### udev Rules for Pico Access
+
+Install the included udev rules to access the Pico without sudo:
+
+```bash
+sudo cp 99-pico.rules /etc/udev/rules.d/
+sudo udevadm control --reload-rules
+sudo udevadm trigger
+```
+
+This enables:
+- Serial access via `/dev/ttyACM0` (normal mode)
+- picotool access in BOOTSEL mode
+- No sudo required for flashing or serial communication
+
+### Required Tools
+
+- **TinyGo**: For compiling firmware (`tinygo flash` or `tinygo build -o file.uf2`)
+- **picotool**: For flashing and rebooting device (`picotool load`, `picotool reboot`)
+- **Serial terminal**: For debug output (`cat /dev/ttyACM0`, `minicom`, etc.)
+
 ## Key Technical Requirements
 - PIO for timing-critical operations (HSYNC, pixel output)
 - DMA for feeding pixel data to PIO (CPU alone is too slow/jittery)
@@ -228,7 +251,107 @@ picotool load hello.uf2 -x
 
 ---
 
-## Next Steps
+## Current Working State (2025-01-20)
+
+**hello_world.go - Frame Buffer Rendering via PIO**
+
+**Status: WORKING with limitations**
+
+- VGA signal detected and stable
+- HSYNC: ~31657 Hz (target 31468 Hz, 0.6% off)
+- VSYNC: 60 Hz (correct)
+- Frame buffer content visible (animation cycling)
+- 7-sample horizontal resolution (low res proof of concept)
+
+**Issues to fix:**
+1. Vertical edges jittery/sawblade-like (line-to-line timing variance)
+2. Low horizontal resolution (only 7 sample points)
+3. ✅ Reboot to BOOTSEL - FIXED using `//go:linkname enterBootloader machine.enterBootloader`
+
+**Architecture:**
+- SM0 (HSYNC): Generates timing, fires IRQ 0 (CPU) and IRQ 4 (RGB SM)
+- SM1 (RGB): Outputs 7 pulled colors + hardcoded black (same as working color bars)
+- CPU (Core1): Samples frame buffer at 7 positions per line, pushes to PIO
+- CPU (Core0): Runs animation loop, handles serial
+
+**Key learnings:**
+1. Composable scanline format requires DMA - CPU too slow for 640 pixels/line
+2. Simple 7-bar approach works well for proof of concept
+3. Must match main.go's RGB PIO program exactly for stable output
+4. ROM function pointer calls for reset_usb_boot are tricky in TinyGo
+
+---
+
+## Scanvideo Port Status (2025-01-20)
+
+### Package Status
+
+| Package | File | Status | Notes |
+|---------|------|--------|-------|
+| scanvideo | types.go | Complete | Timing, Mode, ScanlineBuffer, RGB565 |
+| scanvideo | pio.go | Complete | BuildTimingProgram, BuildScanlineProgram (composable) |
+| scanvideo | driver.go | ~80% | Setup, DMA, IRQ handler - needs integration testing |
+| gvga | types.go | Complete | GVga struct, Color, Font types |
+| gvga | gvga.go | **CPU output** | Still uses GPIO bit-bang - causes jitter |
+| gvga | gfx.go | Complete | Graphics primitives |
+| gvga | font.go | Complete | Default font data |
+| gvga | palette.go | Complete | Palette lookup tables |
+
+### Original GVga Architecture (C)
+```
+┌─────────────────────────────────────────────────────────────┐
+│ Core 0: Application                                          │
+│   - gvga_init() → allocate frame buffer, palette             │
+│   - gfx_*() → draw to frame buffer                           │
+│   - gvga_swap() → double buffer swap                         │
+└─────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────┐
+│ Core 1: Render Loop (scanvideo)                              │
+│   1. scanvideo_begin_scanline_generation(true)               │
+│   2. scanlineRender() → fill buffer with composable commands │
+│   3. scanvideo_end_scanline_generation()                     │
+│   4. DMA transfers buffer to PIO                             │
+└─────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────┐
+│ PIO: Composable Scanline Program                             │
+│   - Waits for IRQ 4 from timing SM                           │
+│   - Executes commands: COLOR_RUN, RAW_RUN, RAW_1P, EOL_ALIGN │
+│   - Outputs pixels at 25 MHz via OUT pins                    │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Current hello_world.go Architecture (TinyGo)
+```
+┌─────────────────────────────────────────────────────────────┐
+│ Core 0: Animation loop, serial handling                      │
+└─────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────┐
+│ Core 1: Render goroutine                                     │
+│   - Wait for IRQ 0                                           │
+│   - Push 7 pre-computed colors to PIO FIFO                   │
+│   - Compute colors for next line (during display)            │
+│   - Handle VSYNC                                             │
+└─────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────┐
+│ PIO: Simple RGB Program (not composable)                     │
+│   - Waits for IRQ 4                                          │
+│   - Outputs 7 pulled colors + 1 hardcoded black              │
+│   - Each "bar" is ~109 cycles (80 pixels)                    │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Key Differences / Missing Pieces
+
+1. **Composable scanlines**: Original uses RAW_RUN for 640 individual pixels; current uses 7 "bars"
+2. **DMA transfer**: Original uses DMA to feed scanline buffer; current uses CPU TxPut()
+3. **Buffer management**: Original uses scanline buffer pool with Begin/End; current has none
+4. **Full resolution**: Original outputs 640 pixels/line; current outputs 7 color samples
+
+### Next Steps
 
 1. ✅ Restore working color bars (073f37a) - DONE
 2. ✅ Verify color bars work - DONE (jagged but visible)
@@ -236,7 +359,108 @@ picotool load hello.uf2 -x
 4. ✅ Implement PIO-based pixel output (PIO shifts out pixels, not CPU) - DONE
 5. ✅ Add DMA to feed scanline data to PIO - DONE
 6. ✅ Port composable scanline format from scanvideo - DONE
-7. Test hello_world.uf2 on hardware
-8. Fix timing issues if needed (back porch, pixel alignment)
-9. Add run-length optimization for solid regions (COLOR_RUN)
-10. Port remaining gvga features (text mode, multi-bit color)
+7. ✅ Reboot to BOOTSEL - DONE (using //go:linkname enterBootloader)
+8. 🔄 Fix vertical edge jitter - IN PROGRESS (pre-computed colors)
+9. 🔄 **Full 640-pixel composable scanlines** - IN PROGRESS (monitor shows "not supported")
+10. **Update gvga package to use scanvideo (not CPU output)**
+11. Add run-length optimization (COLOR_RUN for solid regions)
+12. Port remaining gvga features (text mode, multi-bit color)
+
+---
+
+## Composable Scanline Attempt (2025-01-20)
+
+**Status: Monitor shows "not supported" - timing investigation in progress**
+
+### Implementation Details
+
+hello_world.go now implements full 640-pixel composable scanlines:
+
+**Architecture:**
+- **SM0 (HSYNC)**: 25 MHz, generates timing, fires IRQ 0 + IRQ 4
+- **SM1 (RGB)**: 50 MHz (2x pixel clock), composable scanline program at offset 0
+- **DMA Channel 0**: Transfers 323 words per scanline to PIO TX FIFO
+- **Core1**: Builds scanline buffers from frame buffer using palette lookup
+- **Core0**: Animation + serial debug output
+
+**Composable PIO Program** (must be at offset 0):
+```
+Offset 0:  out null, 32        ; end_of_scanline_skip_ALIGN
+Offset 1:  wait irq 4          ; entry_point - wait for timing
+Offset 2:  out pc, 16          ; dispatch based on command
+Offset 3:  out pins, 16        ; color_run - output color
+Offset 4:  out x, 16           ; load count
+Offset 5:  jmp x-- 5 [1]       ; color_loop
+Offset 6:  out pc, 16 [1]      ; next command
+Offset 7:  out pins, 16        ; raw_run - first pixel
+Offset 8:  out x, 16           ; load count
+Offset 9:  out pins, 16        ; pixel_loop
+Offset 10: jmp x-- 9           ; loop
+Offset 11: out pins, 16        ; raw_1p
+Offset 12: out pc, 16          ; next command
+Offset 13: out pins, 16 [1]    ; raw_2p (wraps)
+Offset 14: out pins, 32        ; raw_1p_skip_ALIGN
+Offset 15: out pc, 16          ; nop_extra0
+```
+
+**Scanline Buffer Format** (RAW_RUN for 640 pixels):
+```
+Word 0:  COMPOSABLE_RAW_RUN (7) | first_pixel << 16
+Word 1:  count (637) | second_pixel << 16
+Word 2:  pixel3 | pixel4 << 16
+...
+Word 322: COMPOSABLE_RAW_1P (11) | 0 << 16
+Word 323: COMPOSABLE_EOL_ALIGN (1) << 16
+```
+
+**Palette Lookup Table:**
+- 256 × 8 = 2048 entries
+- For each byte value (0-255), pre-compute 8 RGB565 colors
+- Enables fast 1bpp → RGB565 conversion during scanline build
+
+### Timing Calibration (Composable Mode)
+
+| Count | HSYNC (Hz) | VSYNC (Hz) | Lines/frame | Notes |
+|-------|------------|------------|-------------|-------|
+| 695   | 48,593     | 92         | 525         | Way too fast |
+| 1073  | 35,337     | 67         | 525         | Still too fast |
+| 1205  | 31,885     | 60         | 525         | Close! 1.3% off |
+
+**Current state with count=1205:**
+- HSYNC: 31,885 Hz (target 31,468 Hz) - 1.3% high
+- VSYNC: 60 Hz (correct)
+- Lines/frame: 525 (correct)
+- Monitor still shows "not supported"
+
+### Key Findings
+
+1. **RGB SM clock must be 2x pixel clock**: Each pixel in raw_run takes 2 PIO cycles (out + jmp), so SM needs 50 MHz to achieve 25 MHz pixel rate
+
+2. **HSYNC timing count differs from 8-bar version**: The 8-bar approach used count=1172, but composable needs different tuning (currently at 1205)
+
+3. **Frequency measurement is essential**: Added debug output showing actual HSYNC/VSYNC frequencies in Hz
+
+4. **Serial runs on Core0, render on Core1**: Using goroutine for render loop correctly separates concerns
+
+### Issues to Investigate
+
+1. **Why "not supported" with correct frequencies?**
+   - HSYNC polarity? (currently active-low)
+   - VSYNC polarity? (currently active-low)
+   - Pixel timing within line?
+   - Back porch / front porch timing?
+
+2. **Timing count doesn't match theoretical calculation**
+   - Theory: 794 cycles/line at 25 MHz for 31.468 kHz
+   - Actual: count=1205 gives 31.885 kHz
+   - Discrepancy suggests PIO program overhead is different than calculated
+
+3. **DMA transfer timing**
+   - Is DMA completing before next IRQ?
+   - Is FIFO being starved or overfilled?
+
+### Files Modified
+
+- `hello_world.go` - Full composable scanline implementation with DMA
+- `scanvideo/pio.go` - Correct composable PIO program offsets
+- `scanvideo/types.go` - COMPOSABLE_* constants
