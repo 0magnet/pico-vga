@@ -16,46 +16,83 @@ Port GVga library and pico-extras scanvideo library to TinyGo for Raspberry Pi P
 
 ---
 
-## Current Working State (commit 073f37a restored)
+## Current Working State (commit 49d1b12 - Two-SM PIO RGB)
 
 **Test Date: 2025-01-20**
 
-**Result: Color bars visible, approximately correct sizes**
+**Result: Color bars with SMOOTH EDGES!**
+
+This is a major breakthrough - PIO-based pixel output eliminates jitter.
+
+**Physical Measurements:**
+- Monitor diagonal: ~55 cm (likely 22" 16:9 monitor)
+- Monitor width: ~47.7 cm
+- White bar: ~4.7 cm
+- Yellow/Cyan/Green/Magenta/Red/Blue bars: ~5.7 cm each
+- Black bar: ~7.5 cm
+
+**Math Check:**
+- Total measured: 4.7 + (6 × 5.7) + 7.5 = 4.7 + 34.2 + 7.5 = 46.4 cm
+- Monitor width: 47.7 cm
+- Difference: ~1.3 cm (borders/overscan)
+
+**Pixel Width Derivation:**
+- 640 pixels across ~47.7 cm = 0.0745 cm/pixel = 0.745 mm/pixel
+- Expected bar width: 640/8 = 80 pixels = 5.96 cm
+
+**Actual vs Expected Bar Widths:**
+| Bar    | Measured | Pixels (est) | Expected | Difference |
+|--------|----------|--------------|----------|------------|
+| White  | 4.7 cm   | ~63 pixels   | 80       | -17 pixels |
+| Colors | 5.7 cm   | ~77 pixels   | 80       | -3 pixels  |
+| Black  | 7.5 cm   | ~101 pixels  | 80       | +21 pixels |
+
+**Analysis:**
+- White bar is too narrow (back porch eating into it?)
+- Color bars slightly narrow but close
+- Black bar too wide (gets remaining time at end of line)
+- Total pixel budget seems correct, just distributed unevenly
+
+**Current Architecture (Two-SM PIO):**
+- **SM0 (HSYNC)**:
+  - Generates HSYNC timing at 25 MHz
+  - Fires IRQ 0 (CPU notification) and IRQ 4 (RGB SM trigger)
+  - count=1172 for ~31.4 kHz HSYNC
+- **SM1 (RGB)**:
+  - Waits for IRQ 4 from HSYNC SM
+  - Back porch: ~104 cycles delay
+  - Color bars: 7 pulled colors + 1 hardcoded black
+  - Each bar: ~109 cycles (x=6 iterations × 17 cycles)
+  - Outputs via `mov pins, osr` at fixed 25 MHz rate
+- **CPU**:
+  - Waits for IRQ 0
+  - Pushes 8 colors to RGB SM FIFO for next line
+  - Handles VSYNC
+- **DMA**: NOT USED (yet)
+
+**Why edges are now smooth:**
+PIO outputs pixels at fixed 25 MHz clock rate. No CPU jitter involved in pixel timing.
+
+**Remaining timing issues:**
+The bar widths aren't exactly 80 pixels each because:
+1. Back porch delay in RGB SM may be wrong
+2. Per-bar loop count may not give exactly 80 pixels
+3. End-of-line handling gives black bar extra time
+
+---
+
+## Previous State (commit 073f37a - CPU pixel output)
+
+**Result: Color bars visible but JAGGED EDGES**
+
+**Architecture:**
+- PIO: HSYNC timing only
+- CPU: Outputs colors via GPIO (causes jitter)
+- DMA: Not used
 
 **Issues:**
-1. Black and white bars are slightly thin
-2. Edges of color bars are jagged (vertical lines not smooth)
-
-**Current Architecture:**
-- **PIO**: Generates HSYNC timing only
-  - Runs at 25 MHz (125 MHz / 5 clock divider)
-  - High period controlled by count in X register (count=1172)
-  - Low period fixed at 95 cycles (3x set instructions with delays)
-  - Fires IRQ 0 at end of sync pulse to notify CPU
-- **CPU**: Handles everything else
-  - Waits for PIO IRQ 0 (busy-wait loop)
-  - Outputs back porch delay (60 iterations of volatile read)
-  - Outputs color bars via GPIO set/clear (100 iterations per bar)
-  - Handles VSYNC directly via GPIO
-- **DMA**: NOT USED
-
-**Why edges are jagged:**
-CPU timing jitter causes inconsistent pixel widths. Sources of jitter:
-1. Go runtime overhead (garbage collection, scheduler)
-2. Variable loop iteration times
-3. Memory access latency variations
-4. Pipeline stalls
-5. No cycle-accurate timing guarantee from CPU
-
-**Why some bars are thin:**
-The 100-iteration delay loops don't precisely match 80 pixels worth of time.
-Each bar should be 80 pixels at 25 MHz = 3.2 µs = 400 CPU cycles at 125 MHz.
-But loop overhead and Go compiler output varies.
-
-**Measured Frequencies (from earlier tests with timing code):**
-- HSYNC: ~31440 Hz (target: 31468 Hz) - 0.09% error, acceptable
-- VSYNC: ~59 Hz (target: 60 Hz) - acceptable
-- Lines/frame: 525 (correct)
+- Edges jagged due to CPU timing jitter
+- Black/white bars thin
 
 ---
 
