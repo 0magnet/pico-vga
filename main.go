@@ -276,45 +276,52 @@ func main() {
 		rgbSM.TxPut(c)
 	}
 
-	// Main loop - push colors and handle VSYNC
-	frameCount := 0
-	lineCount := 0
+	// Shared frame counter for reporting
+	var frameCount volatile.Register32
 
+	// Run render loop on core1 via goroutine
+	go func() {
+		lineCount := 0
+
+		for {
+			// Wait for PIO IRQ 0 (line complete)
+			for Pio.GetIRQ()&1 == 0 {
+				// Busy wait for IRQ
+			}
+			Pio.ClearIRQ(1) // Clear IRQ 0
+
+			lineCount++
+
+			// Push colors for next line (during blanking period)
+			if lineCount < 480 {
+				// Active video - push color bars
+				for _, c := range colorBars {
+					rgbSM.TxPut(c)
+				}
+			} else {
+				// Vertical blanking - push black
+				for i := 0; i < 8; i++ {
+					rgbSM.TxPut(0)
+				}
+			}
+
+			// Handle VSYNC
+			if lineCount == vSyncStart {
+				pinVSYNC.Low()
+			} else if lineCount == vSyncEnd {
+				pinVSYNC.High()
+			} else if lineCount >= vTotal {
+				lineCount = 0
+				frameCount.Set(frameCount.Get() + 1)
+			}
+		}
+	}()
+
+	// Main loop on core0 - handles USB/serial
+	println("Render loop started on core1")
 	for {
-		// Wait for PIO IRQ 0 (line complete)
-		for Pio.GetIRQ()&1 == 0 {
-			// Busy wait for IRQ
-		}
-		Pio.ClearIRQ(1) // Clear IRQ 0
-
-		lineCount++
-
-		// Push colors for next line (during blanking period)
-		if lineCount < 480 {
-			// Active video - push color bars
-			for _, c := range colorBars {
-				rgbSM.TxPut(c)
-			}
-		} else {
-			// Vertical blanking - push black
-			for i := 0; i < 8; i++ {
-				rgbSM.TxPut(0)
-			}
-		}
-
-		// Handle VSYNC
-		if lineCount == vSyncStart {
-			pinVSYNC.Low()
-		} else if lineCount == vSyncEnd {
-			pinVSYNC.High()
-		} else if lineCount >= vTotal {
-			lineCount = 0
-			frameCount++
-			// Print status every 60 frames (~1 second)
-			if frameCount%60 == 0 {
-				println("Frame:", frameCount)
-			}
-		}
+		time.Sleep(time.Second)
+		println("Frame:", frameCount.Get())
 	}
 }
 

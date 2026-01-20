@@ -151,8 +151,13 @@ The pico-extras scanvideo library uses option 2 (DMA + PIO).
 - **This is the current restored state**
 
 ### Commit 49d1b12: "PIO-based RGB output with 8 color bars"
-- Attempted PIO for RGB output
-- Need to review this approach
+- Two-SM PIO architecture: HSYNC SM + RGB SM
+- SM0 fires IRQ 4 to trigger SM1 (RGB output)
+- CPU feeds 8 colors to FIFO each line
+- **Result: SMOOTH EDGES!** But bar widths not perfect
+- **Issue observed**: After running for a moment, bars shift right and fade
+  - Possible FIFO sync issue - CPU not keeping up?
+  - Tight render loop blocks USB, causing session to hang
 
 ---
 
