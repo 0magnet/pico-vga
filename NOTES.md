@@ -179,11 +179,64 @@ The pico-extras scanvideo library uses option 2 (DMA + PIO).
 
 ---
 
+## Hello World Demo (hello_world.go)
+
+**Test Date: 2025-01-20**
+
+**Implementation: DMA + Composable PIO (port of scanvideo approach)**
+
+This is a direct port of the pico-extras scanvideo library approach to TinyGo.
+
+**Architecture:**
+- **SM0 (HSYNC)**: Generates HSYNC timing, fires IRQ 0 (CPU) and IRQ 4 (RGB SM)
+- **SM1 (RGB)**: Composable scanline program (based on scanvideo.pio)
+  - Supports: `color_run`, `raw_run`, `raw_1p`, `raw_2p`, `eol_align`
+  - Uses `out pc, 16` for command dispatch
+  - Autopull enabled for continuous DMA feeding
+- **DMA Channel 0**: Transfers scanline buffer to PIO1 TX FIFO
+  - DREQ-gated by PIO TX not-full
+  - Triggered per scanline after IRQ 0
+- **CPU (Core1)**: Builds composable scanlines from frame buffer
+- **CPU (Core0)**: Animation loop + serial output
+
+**Composable Scanline Format:**
+```
+RAW_RUN: | cmd | color1 | count-1 | color2 | color3 | color4 | ... |
+COLOR_RUN: | cmd | color | count-3 | next_cmd | ... |
+RAW_1P: | cmd | color | next_cmd |
+RAW_2P: | cmd | color1 | color2 | (wraps to RAW_1P) |
+EOL_ALIGN: | cmd | 0 | (discards remaining, waits for IRQ) |
+```
+
+**Features:**
+- 640x480 @ 60Hz, 1-bit color (black/white)
+- Frame buffer: 38400 bytes (640×480/8)
+- Double-buffered scanline buffers
+- Animated "HELLO WORLD" bouncing text
+- Border boxes for visual reference
+
+**Files:**
+- `hello_world.go` - Main demo source
+- `hello.uf2` - Compiled firmware
+
+**To Test:**
+```bash
+# Put Pico in BOOTSEL mode (hold BOOTSEL while plugging in)
+picotool load hello.uf2 -x
+# Or copy to mounted Pico drive
+```
+
+---
+
 ## Next Steps
 
 1. ✅ Restore working color bars (073f37a) - DONE
 2. ✅ Verify color bars work - DONE (jagged but visible)
-3. Review commit 49d1b12 for PIO RGB output approach
-4. Implement PIO-based pixel output (PIO shifts out pixels, not CPU)
-5. Add DMA to feed scanline data to PIO
-6. Port composable scanline format from scanvideo
+3. ✅ Review commit 49d1b12 for PIO RGB output approach - DONE
+4. ✅ Implement PIO-based pixel output (PIO shifts out pixels, not CPU) - DONE
+5. ✅ Add DMA to feed scanline data to PIO - DONE
+6. ✅ Port composable scanline format from scanvideo - DONE
+7. Test hello_world.uf2 on hardware
+8. Fix timing issues if needed (back porch, pixel alignment)
+9. Add run-length optimization for solid regions (COLOR_RUN)
+10. Port remaining gvga features (text mode, multi-bit color)
