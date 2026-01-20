@@ -1,0 +1,571 @@
+package scanvideo
+
+import (
+	"device/rp"
+	"machine"
+	"runtime/interrupt"
+	"runtime/volatile"
+	"sync"
+	"unsafe"
+
+	pio "github.com/tinygo-org/pio/rp2-pio"
+)
+
+// Configuration constants
+const (
+	ScanlineBufferCount    = 8   // Number of scanline buffers
+	MaxScanlineBufferWords = 320 // Max words per scanline buffer (enough for 640 pixels)
+
+	// State machine assignments
+	ScanlineSM = 0 // SM0 for scanline output
+	TimingSM   = 3 // SM3 for timing
+
+	// DMA channels
+	ScanlineDMAChannel = 0
+)
+
+// Driver state
+var (
+	videoPIO  *pio.PIO
+	videoMode Mode
+	timing    *Timing
+
+	// Scanline buffers
+	scanlineBuffers [ScanlineBufferCount]scanlineBufferInternal
+	freeList        *scanlineBufferInternal
+	generatedList   *scanlineBufferInternal
+	generatedTail   *scanlineBufferInternal
+	inUseList       *scanlineBufferInternal
+	currentBuffer   *scanlineBufferInternal
+
+	// Timing state
+	timingState struct {
+		vActive     int32
+		vTotal      int32
+		vPulseStart int32
+		vPulseEnd   int32
+		vsyncPulse  uint32
+		vsyncNoPulse uint32
+		vsyncBits   uint32
+
+		// Timing DMA states (4 states per line)
+		a, aVblank uint32
+		b1, b2     uint32
+		c, cVblank uint32
+
+		stateIndex     uint16
+		timingScanline int32
+		inVblank       bool
+	}
+	dmaStates [4]uint32
+
+	// Scanline tracking
+	nextScanlineID uint32
+	lastScanlineID uint32
+	yRepeatIndex   uint16
+	yRepeatTarget  uint16
+
+	// Synchronization
+	stateLock sync.Mutex
+
+	// Missing scanline data (blue line shown when buffer not ready)
+	missingData [4]uint32
+
+	// Video enabled flags
+	timingEnabled  bool
+	displayEnabled bool
+
+	// IRQ handler installed flag
+	irqInstalled bool
+)
+
+// Internal scanline buffer with linked list support
+type scanlineBufferInternal struct {
+	core ScanlineBuffer
+	next *scanlineBufferInternal
+	data [MaxScanlineBufferWords]uint32
+}
+
+// DMA channel hardware registers
+type dmaChannelHW struct {
+	ReadAddr   volatile.Register32
+	WriteAddr  volatile.Register32
+	TransCount volatile.Register32
+	CtrlTrig   volatile.Register32
+	pad        [12]volatile.Register32 // Aliases and padding
+}
+
+func getDMAChannel(ch int) *dmaChannelHW {
+	base := uintptr(0x50000000) + uintptr(ch)*0x40
+	return (*dmaChannelHW)(unsafe.Pointer(base))
+}
+
+// Setup initializes the video system with the given mode
+func Setup(mode *Mode) bool {
+	return SetupWithTiming(mode, mode.DefaultTiming)
+}
+
+// SetupWithTiming initializes the video system with custom timing
+func SetupWithTiming(mode *Mode, t *Timing) bool {
+	videoMode = *mode
+	timing = t
+
+	if videoMode.YScaleDenom == 0 {
+		videoMode.YScaleDenom = 1
+	}
+
+	// Initialize scanline buffers
+	for i := 0; i < ScanlineBufferCount; i++ {
+		scanlineBuffers[i].core.Data = scanlineBuffers[i].data[:]
+		scanlineBuffers[i].core.DataMax = MaxScanlineBufferWords
+		if i < ScanlineBufferCount-1 {
+			scanlineBuffers[i].next = &scanlineBuffers[i+1]
+		}
+	}
+	freeList = &scanlineBuffers[0]
+	lastScanlineID = 0xFFFFFFFF
+
+	// Setup missing scanline data (shows blue when buffer not ready)
+	missingData[0] = uint32(OffsetColorRun) | (uint32(RGB565(0, 0, 255)) << 16)
+	missingData[1] = uint32(mode.Width-3) | (uint32(OffsetRaw1P) << 16)
+	missingData[2] = 0 | (uint32(OffsetEOLAlign) << 16)
+
+	// Get PIO instance
+	videoPIO = pio.PIO0
+
+	// Enable DMA
+	rp.RESETS.RESET.ClearBits(rp.RESETS_RESET_DMA)
+	for !rp.RESETS.RESET_DONE.HasBits(rp.RESETS_RESET_DONE_DMA) {
+	}
+
+	// Configure GPIO pins
+	for i := uint8(0); i < ColorPinCount; i++ {
+		pin := machine.Pin(uint8(ColorPinBase) + i)
+		pin.Configure(machine.PinConfig{Mode: videoPIO.PinMode()})
+	}
+	for i := uint8(0); i < 2; i++ {
+		pin := machine.Pin(uint8(SyncPinBase) + i)
+		pin.Configure(machine.PinConfig{Mode: videoPIO.PinMode()})
+	}
+
+	// Load and configure scanline PIO program
+	scanlineProgram := BuildScanlineProgram(mode.XScale)
+	var err error
+	offset, err := videoPIO.AddProgram(scanlineProgram, 0) // Must be at offset 0
+	if err != nil {
+		println("Failed to load scanline program:", err.Error())
+		return false
+	}
+	scanlineOffset = offset
+
+	scanlineSM := videoPIO.StateMachine(ScanlineSM)
+	scanlineSM.TryClaim()
+	ConfigureScanlineSM(videoPIO, scanlineSM, scanlineOffset)
+
+	// Load and configure timing PIO program
+	timingProgram := BuildTimingProgram()
+	offset, err = videoPIO.AddProgram(timingProgram, -1)
+	if err != nil {
+		println("Failed to load timing program:", err.Error())
+		return false
+	}
+	timingOffset = offset
+
+	timingSM := videoPIO.StateMachine(TimingSM)
+	timingSM.TryClaim()
+	ConfigureTimingSM(videoPIO, timingSM, timingOffset)
+
+	// Configure DMA for scanline data transfer
+	setupDMA()
+
+	// Initialize timing state
+	initTimingState()
+
+	displayEnabled = true
+
+	return true
+}
+
+// setupDMA configures DMA for scanline transfer
+func setupDMA() {
+	dma := getDMAChannel(ScanlineDMAChannel)
+
+	// Get PIO TX FIFO address
+	scanlineSM := videoPIO.StateMachine(ScanlineSM)
+	txFifoAddr := uint32(uintptr(unsafe.Pointer(&scanlineSM.TxReg().Reg)))
+
+	// Configure DMA control
+	ctrl := uint32(0)
+	ctrl |= 1 << 0   // Enable
+	ctrl |= 1 << 1   // High priority
+	ctrl |= 2 << 2   // 32-bit transfers
+	ctrl |= 1 << 4   // Increment read address
+	ctrl |= 0 << 15  // DREQ = PIO0_TX0 (for SM0)
+	ctrl |= 1 << 21  // IRQ quiet (we'll trigger completion manually)
+
+	dma.WriteAddr.Set(txFifoAddr)
+	dma.CtrlTrig.Set(ctrl & ^uint32(1)) // Configure but don't enable yet
+
+	// Enable DMA IRQ
+	rp.DMA.INTE0.SetBits(1 << ScanlineDMAChannel)
+}
+
+// initTimingState sets up the timing state machine parameters
+func initTimingState() {
+	timingState.vTotal = int32(timing.VTotal)
+	timingState.vActive = int32(timing.VActive)
+	timingState.vPulseStart = int32(timing.VActive + timing.VFrontPorch)
+	timingState.vPulseEnd = timingState.vPulseStart + int32(timing.VPulse)
+
+	// VSYNC polarity - bit 30 controls vsync pin
+	vsyncBit := uint32(0x40000000)
+	if timing.VSyncPolarity != 0 {
+		timingState.vsyncPulse = 0
+		timingState.vsyncNoPulse = vsyncBit
+	} else {
+		timingState.vsyncPulse = vsyncBit
+		timingState.vsyncNoPulse = 0
+	}
+
+	// Calculate timing state values
+	// Each timing word contains: instruction | (cycles-3) << 16 | pins << 29
+	hSyncBit := uint32(0)
+	if timing.HSyncPolarity == 0 {
+		hSyncBit = 1
+	}
+
+	// State A: Start of line (sets IRQ 0 for active, IRQ 1 for vblank)
+	// Short 4-cycle segment
+	timingState.a = encodeTimingState(SetIRQ0, 4, hSyncBit)
+	timingState.aVblank = encodeTimingState(SetIRQ1, 4, hSyncBit)
+
+	// State B1: Main back porch (clears scanline IRQ)
+	backPorch := int(timing.HTotal - timing.HActive - timing.HFrontPorch - timing.HPulse)
+	timingState.b1 = encodeTimingState(ClearIRQScanline, uint16(backPorch/2), hSyncBit)
+	timingState.b2 = encodeTimingState(ClearIRQScanline, uint16(backPorch-backPorch/2), hSyncBit)
+
+	// State C: Active display + front porch (sets scanline IRQ at end)
+	// The scanline IRQ tells the scanline SM to start outputting
+	activeAndFront := int(timing.HActive + timing.HFrontPorch)
+	timingState.c = encodeTimingState(SetIRQScanline, uint16(activeAndFront), hSyncBit)
+	timingState.cVblank = encodeTimingState(ClearIRQScanline, uint16(activeAndFront), hSyncBit)
+
+	// Start with vblank states
+	setupDMAStatesVblank()
+	timingState.vsyncBits = timingState.vsyncNoPulse
+}
+
+func encodeTimingState(state int, cycles uint16, pins uint32) uint32 {
+	// Format: instruction(16) | (cycles-3)(13) | pins(3)
+	instr := TimingStateInstructions[state]
+	return uint32(instr) | (uint32(cycles-3) << 16) | (pins << 29)
+}
+
+func setupDMAStatesVblank() {
+	dmaStates[0] = timingState.aVblank
+	dmaStates[1] = timingState.b1
+	dmaStates[2] = timingState.b2
+	dmaStates[3] = timingState.cVblank
+}
+
+func setupDMAStatesActive() {
+	dmaStates[0] = timingState.a
+	dmaStates[1] = timingState.b1
+	dmaStates[2] = timingState.b2
+	dmaStates[3] = timingState.c
+}
+
+// TimingEnable starts or stops video timing
+func TimingEnable(enable bool) {
+	if enable == timingEnabled {
+		return
+	}
+	timingEnabled = enable
+
+	if enable {
+		// Install IRQ handler if not done yet
+		if !irqInstalled {
+			interrupt.New(rp.IRQ_PIO0_IRQ_0, pioIRQHandler).Enable()
+			irqInstalled = true
+		}
+
+		// Enable PIO IRQs via direct hardware access
+		// IRQ0 enable bits: bits 0-7 are SM IRQs, bits 8-11 are FIFO IRQs
+		rp.PIO0.IRQ0_INTE.SetBits(0x03) // Enable IRQ 0 and 1 (active scanline and vblank)
+
+		// Enable timing SM FIFO not full IRQ on IRQ1
+		rp.PIO0.IRQ1_INTE.SetBits(1 << (TimingSM + 4)) // TX not full for SM3
+
+		// Prime the timing FIFO
+		topUpTimingFIFO()
+
+		// Start state machines
+		videoPIO.StateMachine(TimingSM).SetEnabled(true)
+		videoPIO.StateMachine(ScanlineSM).SetEnabled(true)
+	} else {
+		// Disable state machines
+		videoPIO.StateMachine(TimingSM).SetEnabled(false)
+		videoPIO.StateMachine(ScanlineSM).SetEnabled(false)
+
+		// Disable IRQs
+		rp.PIO0.IRQ0_INTE.ClearBits(0x03)
+		rp.PIO0.IRQ1_INTE.ClearBits(1 << (TimingSM + 4))
+	}
+}
+
+// pioIRQHandler handles PIO IRQs for timing and scanline
+//go:nosplit
+func pioIRQHandler(intr interrupt.Interrupt) {
+	irqFlags := videoPIO.GetIRQ()
+
+	// IRQ 0: Active scanline start
+	if irqFlags&1 != 0 {
+		videoPIO.ClearIRQ(1)
+		if displayEnabled {
+			prepareForActiveScanline()
+		}
+	}
+
+	// IRQ 1: Vblank scanline
+	if irqFlags&2 != 0 {
+		videoPIO.ClearIRQ(3) // Clear both for good measure
+		prepareForVblankScanline()
+	}
+
+	// Top up timing FIFO
+	topUpTimingFIFO()
+}
+
+// topUpTimingFIFO keeps the timing SM FIFO fed
+//go:nosplit
+func topUpTimingFIFO() {
+	timingSM := videoPIO.StateMachine(TimingSM)
+
+	for !timingSM.IsTxFIFOFull() {
+		// Push next timing state
+		timingSM.TxPut(dmaStates[timingState.stateIndex] | timingState.vsyncBits)
+
+		timingState.stateIndex++
+		if timingState.stateIndex >= 4 {
+			timingState.stateIndex = 0
+			timingState.timingScanline++
+
+			// Handle vertical timing transitions
+			if timingState.timingScanline >= timingState.vActive {
+				if timingState.timingScanline >= timingState.vTotal {
+					// Start of new frame
+					timingState.timingScanline = 0
+					setupDMAStatesActive()
+				} else if timingState.timingScanline == timingState.vActive {
+					// Start of vblank
+					setupDMAStatesVblank()
+				} else if timingState.timingScanline == timingState.vPulseStart {
+					// VSYNC pulse start
+					timingState.vsyncBits = timingState.vsyncPulse
+				} else if timingState.timingScanline == timingState.vPulseEnd {
+					// VSYNC pulse end
+					timingState.vsyncBits = timingState.vsyncNoPulse
+				}
+			}
+		}
+	}
+}
+
+// prepareForActiveScanline handles the start of an active display line
+//go:nosplit
+func prepareForActiveScanline() {
+	// Try to latch a buffer for this scanline
+	var buf *scanlineBufferInternal
+
+	stateLock.Lock()
+	if currentBuffer == nil && generatedList != nil {
+		// Check if the generated buffer matches what we need
+		if generatedList.core.ScanlineID == nextScanlineID {
+			buf = generatedList
+			generatedList = generatedList.next
+			if generatedList == nil {
+				generatedTail = nil
+			}
+			buf.next = inUseList
+			inUseList = buf
+			currentBuffer = buf
+		}
+	} else {
+		buf = currentBuffer
+	}
+	stateLock.Unlock()
+
+	// Start DMA transfer
+	var data *uint32
+	var count uint16
+
+	if buf != nil && buf.core.ScanlineID == nextScanlineID {
+		data = &buf.core.Data[0]
+		count = buf.core.DataUsed
+	} else {
+		// Use missing scanline data
+		data = &missingData[0]
+		count = 3
+	}
+
+	// Configure and start DMA
+	dma := getDMAChannel(ScanlineDMAChannel)
+	dma.ReadAddr.Set(uint32(uintptr(unsafe.Pointer(data))))
+	dma.TransCount.Set(uint32(count))
+	dma.CtrlTrig.SetBits(1) // Enable
+
+	// Update scanline tracking
+	stateLock.Lock()
+	timingState.inVblank = false
+
+	yRepeatIndex += videoMode.YScaleDenom
+	if yRepeatIndex >= yRepeatTarget {
+		// Move to next scanline
+		if buf != nil && buf.core.ScanlineID == nextScanlineID {
+			// Release the buffer
+			releaseBuffer(buf)
+		}
+		yRepeatIndex -= yRepeatTarget
+		nextScanlineID = scanlineIDAfter(nextScanlineID)
+		currentBuffer = nil
+	}
+	stateLock.Unlock()
+}
+
+// prepareForVblankScanline handles vblank scanlines
+//go:nosplit
+func prepareForVblankScanline() {
+	stateLock.Lock()
+	if !timingState.inVblank {
+		timingState.inVblank = true
+		yRepeatIndex = 0
+
+		// Wrap to next frame if needed
+		if ScanlineNumber(nextScanlineID) != 0 {
+			nextScanlineID = (uint32(FrameNumber(nextScanlineID)+1) << 16)
+			yRepeatTarget = uint16(videoMode.YScale)
+		}
+	}
+	stateLock.Unlock()
+}
+
+// releaseBuffer returns a buffer to the free list
+//go:nosplit
+func releaseBuffer(buf *scanlineBufferInternal) {
+	// Remove from in-use list
+	if inUseList == buf {
+		inUseList = buf.next
+	} else {
+		for p := inUseList; p != nil; p = p.next {
+			if p.next == buf {
+				p.next = buf.next
+				break
+			}
+		}
+	}
+
+	// Add to free list
+	buf.next = freeList
+	freeList = buf
+}
+
+// scanlineIDAfter returns the next scanline ID
+func scanlineIDAfter(id uint32) uint32 {
+	line := id & 0xFFFF
+	if line < uint32(videoMode.Height-1) {
+		return id + 1
+	}
+	return (id & 0xFFFF0000) + 0x10000 // Next frame, scanline 0
+}
+
+// BeginScanlineGeneration acquires a buffer to fill with scanline data
+func BeginScanlineGeneration(block bool) *ScanlineBuffer {
+	for {
+		stateLock.Lock()
+		buf := freeList
+		if buf != nil {
+			freeList = buf.next
+			buf.next = nil
+
+			// Assign scanline ID
+			scanlineID := nextScanlineID
+			if !isScanlineAfter(scanlineID, lastScanlineID) {
+				scanlineID = scanlineIDAfter(lastScanlineID)
+			}
+			buf.core.ScanlineID = scanlineID
+			lastScanlineID = scanlineID
+		}
+		stateLock.Unlock()
+
+		if buf != nil {
+			return &buf.core
+		}
+
+		if !block {
+			return nil
+		}
+
+		// Wait for a buffer to become available
+		// In a real implementation, we'd use WFE here
+	}
+}
+
+// EndScanlineGeneration releases a filled scanline buffer
+func EndScanlineGeneration(buf *ScanlineBuffer) {
+	internal := (*scanlineBufferInternal)(unsafe.Pointer(uintptr(unsafe.Pointer(buf)) - unsafe.Offsetof(scanlineBufferInternal{}.core)))
+
+	stateLock.Lock()
+	// Add to generated list (sorted by scanline ID)
+	if generatedList == nil || !isScanlineAfter(buf.ScanlineID, generatedTail.core.ScanlineID) {
+		// Add at end (most common case)
+		if generatedTail != nil {
+			generatedTail.next = internal
+		} else {
+			generatedList = internal
+		}
+		generatedTail = internal
+	} else {
+		// Insert in sorted order
+		var prev *scanlineBufferInternal
+		for p := generatedList; p != nil; p = p.next {
+			if !isScanlineAfter(buf.ScanlineID, p.core.ScanlineID) {
+				break
+			}
+			prev = p
+		}
+		if prev == nil {
+			internal.next = generatedList
+			generatedList = internal
+		} else {
+			internal.next = prev.next
+			prev.next = internal
+		}
+	}
+	stateLock.Unlock()
+}
+
+func isScanlineAfter(id1, id2 uint32) bool {
+	return int32(id1-id2) > 0
+}
+
+// InVblank returns true if currently in vertical blanking interval
+func InVblank() bool {
+	return timingState.inVblank
+}
+
+// WaitForVblank blocks until vblank begins
+func WaitForVblank() {
+	for !InVblank() {
+		// Busy wait - in a real implementation we'd use WFE
+	}
+}
+
+// GetMode returns the current video mode
+func GetMode() Mode {
+	return videoMode
+}
+
+// GetNextScanlineID returns the next scanline ID to be displayed
+func GetNextScanlineID() uint32 {
+	return nextScanlineID
+}
