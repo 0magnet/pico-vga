@@ -155,9 +155,13 @@ The pico-extras scanvideo library uses option 2 (DMA + PIO).
 - SM0 fires IRQ 4 to trigger SM1 (RGB output)
 - CPU feeds 8 colors to FIFO each line
 - **Result: SMOOTH EDGES!** But bar widths not perfect
-- **Issue observed**: After running for a moment, bars shift right and fade
-  - Possible FIFO sync issue - CPU not keeping up?
-  - Tight render loop blocks USB, causing session to hang
+
+### Commit 98064fe: "Fix: Use goroutine for render loop (runs on core1)"
+- **MAJOR FIX**: Render loop in goroutine → runs on core1
+- Main loop on core0 handles USB/serial
+- **Result: Stable video + working serial without interference**
+- Frame rate: ~60 fps confirmed
+- Color bars remain stable even when reading serial output
 
 ---
 
