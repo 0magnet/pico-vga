@@ -319,9 +319,47 @@ func main() {
 
 	// Main loop on core0 - handles USB/serial
 	println("Render loop started on core1")
+	println("Send 'r' to reboot into BOOTSEL mode")
+	for {
+		time.Sleep(100 * time.Millisecond)
+
+		// Check for reboot command
+		if machine.Serial.Buffered() > 0 {
+			b, _ := machine.Serial.ReadByte()
+			if b == 'r' || b == 'R' {
+				println("Rebooting to BOOTSEL...")
+				time.Sleep(100 * time.Millisecond)
+				rebootToBootsel()
+			}
+		}
+	}
+}
+
+// rebootToBootsel reboots the Pico into BOOTSEL mode using ROM function
+func rebootToBootsel() {
+	// Get the ROM function table pointer
+	romFnTablePtr := *(*uint16)(unsafe.Pointer(uintptr(0x00000014)))
+
+	// Get rom_table_lookup function pointer (first entry in table)
+	romTableLookupPtr := *(*uint16)(unsafe.Pointer(uintptr(romFnTablePtr)))
+
+	// Cast to a function that does the lookup
+	type lookupFn func(table uint32, code uint32) uintptr
+	romTableLookup := *(*lookupFn)(unsafe.Pointer(&romTableLookupPtr))
+
+	// Look up reset_usb_boot function (code = 'U' | 'B'<<8 = 0x4255)
+	const resetUSBBootCode = uint32('U') | (uint32('B') << 8)
+	resetFnPtr := romTableLookup(uint32(romFnTablePtr), resetUSBBootCode)
+
+	// Cast to reset_usb_boot function
+	type resetFn func(gpioMask, interfaceMask uint32)
+	resetUSBBoot := *(*resetFn)(unsafe.Pointer(&resetFnPtr))
+
+	// Call it
+	resetUSBBoot(0, 0)
+
 	for {
 		time.Sleep(time.Second)
-		println("Frame:", frameCount.Get())
 	}
 }
 
