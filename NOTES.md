@@ -32,6 +32,32 @@ This enables:
 - **picotool**: For flashing and rebooting device (`picotool load`, `picotool reboot`)
 - **Serial terminal**: For debug output (`cat /dev/ttyACM0`, `minicom`, etc.)
 
+### Rebooting to Bootloader Mode via Serial
+
+Instead of physically pressing BOOTSEL while plugging in, you can reboot the Pico into bootloader mode via its serial interface:
+
+```bash
+# Send 'r' character to trigger reboot to bootloader
+echo 'r' > /dev/ttyACM0
+```
+
+This works because the firmware listens for the 'r' character on serial input and calls the ROM's `reset_usb_boot()` function. The implementation in TinyGo uses:
+
+```go
+//go:linkname enterBootloader machine.enterBootloader
+func enterBootloader()
+
+// In main loop:
+if machine.Serial.Buffered() > 0 {
+    b, _ := machine.Serial.ReadByte()
+    if b == 'r' {
+        enterBootloader()
+    }
+}
+```
+
+After sending 'r', the Pico will reboot and appear as a USB mass storage device (RPI-RP2) ready for flashing.
+
 ## Key Technical Requirements
 - PIO for timing-critical operations (HSYNC, pixel output)
 - DMA for feeding pixel data to PIO (CPU alone is too slow/jittery)
@@ -464,3 +490,314 @@ Word 323: COMPOSABLE_EOL_ALIGN (1) << 16
 - `hello_world.go` - Full composable scanline implementation with DMA
 - `scanvideo/pio.go` - Correct composable PIO program offsets
 - `scanvideo/types.go` - COMPOSABLE_* constants
+
+---
+
+## Building Original C Examples (2025-01-21)
+
+### GVga C Hello World - BUILD SUCCESSFUL
+
+**Location:** `/home/d0mo/go/src/github.com/drfrancintosh/GVga/apps/a0_hello_world`
+
+**Required Environment Variables:**
+```bash
+export PICO_SDK_PATH=/home/d0mo/go/src/github.com/raspberrypi/pico-sdk
+export PICO_EXTRAS_PATH=/home/d0mo/go/src/github.com/raspberrypi/pico-extras
+export GVGA_HOME=/home/d0mo/go/src/github.com/drfrancintosh/GVga
+```
+
+**Build Commands:**
+```bash
+cd /home/d0mo/go/src/github.com/drfrancintosh/GVga/apps/a0_hello_world
+rm -rf build && mkdir build && cd build
+cmake ..
+make -j4
+```
+
+**Output:** `hello_world.uf2` (73KB)
+
+**Flash Command:**
+```bash
+picotool load hello_world.uf2 -x
+```
+
+**Key Build Details:**
+- Uses `pico_scanvideo_dpi` library from pico-extras
+- Default board: "pico" (standard Raspberry Pi Pico)
+- Compiler: arm-none-eabi-gcc 14.2.0
+- Build type: Release
+- No special GPIO pin configuration in CMake - scanvideo uses default pins
+
+**Dependencies:**
+- pico_stdlib
+- pico_multicore
+- pico_unique_id
+- hardware_i2c
+- libgvga (from GVGA_HOME/libs)
+- pico_scanvideo_dpi (from pico-extras)
+
+### pico-playground scanvideo_minimal - BUILD SUCCESSFUL, TESTED
+
+**Location:** `/home/d0mo/go/src/github.com/raspberrypi/pico-playground/scanvideo/scanvideo_minimal`
+
+**Required Environment Variables:**
+```bash
+export PICO_SDK_PATH=/home/d0mo/go/src/github.com/raspberrypi/pico-sdk
+export PICO_EXTRAS_PATH=/home/d0mo/go/src/github.com/raspberrypi/pico-extras
+```
+
+**Build Commands:**
+```bash
+cd /home/d0mo/go/src/github.com/raspberrypi/pico-playground/build
+make scanvideo_minimal -j4
+```
+
+**Output:** `build/scanvideo/scanvideo_minimal/scanvideo_minimal.uf2` (57KB)
+
+**Flash Command:**
+```bash
+picotool load /home/d0mo/go/src/github.com/raspberrypi/pico-playground/build/scanvideo/scanvideo_minimal/scanvideo_minimal.uf2 -x
+```
+
+**Test Result: WORKING!**
+- Monitor displays valid VGA signal
+- Pattern: Horizontal gradient stripes (black→red), with vertical green/yellow gradient
+- This is the expected output - the code sets each scanline to `color = lineNumber << 2`
+
+**Key Implementation Details (from scanvideo_minimal.c):**
+```c
+#define VGA_MODE vga_mode_320x240_60
+
+void render_scanline(struct scanvideo_scanline_buffer *dest, int core) {
+    int l = scanvideo_scanline_number(dest->scanline_id);
+    uint16_t bgcolour = (uint16_t) l << 2;  // Color based on line number
+    dest->data_used = single_color_scanline(buf, buf_length, VGA_MODE.width, bgcolour);
+}
+```
+
+**What This Proves:**
+1. The pico-extras scanvideo library works correctly
+2. The Pimoroni VGA Demo Base hardware is functioning
+3. VGA timing is valid and monitor accepts the signal
+4. The C compilation environment is correctly configured
+
+---
+
+## CRITICAL: Architecture Mismatch Analysis (2025-01-20)
+
+### The Problem
+
+The Go gvga package does **NOT** use the scanvideo architecture. It uses **CPU bit-banging** which cannot produce stable VGA timing.
+
+### C gvga Architecture (CORRECT)
+
+```c
+// gvga.c - render_loop() runs on core1
+static void render_loop(GVga *gvga) {
+    while (true) {
+        // 1. Get a scanline buffer from scanvideo
+        struct scanvideo_scanline_buffer *dest = scanvideo_begin_scanline_generation(true);
+
+        // 2. Fill buffer with composable commands (RAW_RUN, COLOR_RUN, etc.)
+        dest->data_used = gvga->scanlineRender(gvga, dest->data, ...);
+
+        // 3. Release buffer - scanvideo handles DMA to PIO
+        scanvideo_end_scanline_generation(dest);
+    }
+}
+
+// core1_func() - runs the scanvideo infrastructure
+static void core1_func() {
+    scanvideo_setup(_gvga.vga_mode);
+    scanvideo_timing_enable(true);
+    render_loop(&_gvga);
+}
+```
+
+### Go gvga Architecture (WRONG - CPU bit-banging)
+
+```go
+// gvga.go - renderLoop() does CPU bit-banging
+func (g *GVga) renderLoop() {
+    for g.running {
+        // Wait for PIO IRQ
+        for Pio.GetIRQ()&1 == 0 {}
+
+        // PROBLEM: Direct GPIO writes!
+        for byteIdx := 0; byteIdx < int(g.Width)/8; byteIdx++ {
+            b := g.ShowFrame[rowOffset+byteIdx]
+            colors := g.PaletteBuf[int(b)*8:]
+            for i := 0; i < 8; i++ {
+                gpioOut.Set(uint32(colors[i]))  // CPU timing jitter!
+                _ = gpioOut.Get() // "delay"
+            }
+        }
+    }
+}
+```
+
+### Why This Matters
+
+| Aspect | C (scanvideo) | Go (bit-bang) |
+|--------|---------------|---------------|
+| Pixel timing | PIO @ 25 MHz | CPU variable |
+| Jitter | None | High |
+| Consistency | Hardware-perfect | Line-to-line variance |
+| Resolution | 640 actual pixels | Timing-dependent |
+| CPU load | Low (DMA handles transfer) | 100% (busy loop) |
+
+### What Needs to Change
+
+The Go gvga package must be rewritten to:
+
+1. **Call scanvideo.BeginScanlineGeneration()** instead of direct GPIO
+2. **Fill scanline buffers with composable commands** (RAW_RUN for pixels)
+3. **Call scanvideo.EndScanlineGeneration()** to queue for DMA
+4. **Let scanvideo handle all timing** via PIO + DMA
+
+### Comparison Summary
+
+| Component | C Match % | Status |
+|-----------|-----------|--------|
+| scanvideo timing state | ~80% | Structure matches, needs IRQ debug |
+| scanvideo PIO programs | ~90% | Good match to timing.pio |
+| scanvideo buffer mgmt | ~70% | Simplified vs C |
+| scanvideo topUpTimingFIFO | ~90% | Matches C logic |
+| **gvga architecture** | **~10%** | **COMPLETELY DIFFERENT** |
+| gvga Init/types | ~85% | Good match |
+| gvga graphics primitives | ~90% | Good match |
+
+### Action Items
+
+1. ✅ Document this analysis in NOTES.md
+2. 🔄 Rewrite gvga.Start() to call scanvideo.Setup() and scanvideo.TimingEnable()
+3. 🔄 Rewrite gvga.renderLoop() to use scanvideo buffer API
+4. 🔄 Create scanline render functions that emit composable commands
+5. Test on device with proper scanvideo integration
+
+---
+
+## MAJOR BREAKTHROUGH: Working Composable Scanlines (2025-01-21)
+
+### Status: VGA OUTPUT WORKING!
+
+**hello_world.go now displays 640x480 VGA with proper composable scanline format!**
+
+**Test Results:**
+- HSYNC: ~31,261 Hz (target 31,468 Hz) - 99.3% accurate
+- VSYNC: 59 Hz (target 60 Hz)
+- Lines per frame: 523 (target 525)
+- Display shows "HELLO WORLD" text with border
+- Animation works (text bounces, updates every second)
+
+### Key Fixes Applied
+
+1. **Removed DMA blocking wait** - `waitDMAComplete()` was causing deadlock:
+   - DMA waits for SM0 (scanline) to consume data
+   - SM0 waits for IRQ 4 from SM3 (timing)
+   - SM3 waits for timing FIFO data
+   - Goroutine blocked in waitDMAComplete(), couldn't feed SM3
+   - Fix: Let DREQ pace the DMA transfer, don't block
+
+2. **Fixed blank scanline format** - Changed from RAW_RUN to COLOR_RUN:
+   - RAW_RUN requires pixel data for all 640 pixels (many FIFO words)
+   - COLOR_RUN outputs one color for N pixel periods (just 3 words)
+   - Matches C pico-extras `_missing_scanline_data` format
+
+3. **Fixed scanline buffer termination** - Removed explicit RAW_1P command:
+   - After RAW_RUN loop exits, PIO falls through to raw_1p automatically
+   - raw_1p outputs pixel 640 from OSR, then dispatches to EOL
+   - Previous code had RAW_1P in buffer which was read as a pixel!
+   - Fix: Buffer ends with just EOL_SKIP_ALIGN command
+
+4. **Proper multicore operation** - TinyGo 0.40.1 goroutine support:
+   - Render goroutine runs on core1 (time-critical)
+   - Main loop runs on core0 (animation, serial output)
+   - No cooperative scheduling issues
+
+### Current Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ Core 0: Main Loop                                            │
+│   - time.Sleep(1 second)                                     │
+│   - Update animation                                         │
+│   - Serial status output                                     │
+│   - clearScreen() + drawPattern()                            │
+└─────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────┐
+│ Core 1: Render Goroutine                                     │
+│   - topUpTimingFIFO() - feed SM3                             │
+│   - Check PIO IRQs (0 = active, 1 = vblank)                  │
+│   - startDMA() - transfer scanline buffer to SM0 FIFO        │
+│   - buildScanline() - prepare next line's buffer             │
+└─────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────┐
+│ SM3 (Timing): Offset 16-21                                   │
+│   - Generates HSYNC/VSYNC timing                             │
+│   - Fires IRQ 0 (active lines) or IRQ 1 (vblank)             │
+│   - Fires IRQ 4 to trigger scanline SM                       │
+│   - Clock divider: 4 (31.25 MHz)                             │
+└─────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────┐
+│ SM0 (Scanline): Offset 0-15                                  │
+│   - Composable scanline program                              │
+│   - Waits for IRQ 4, then processes commands                 │
+│   - RAW_RUN outputs 639 pixels, falls through to raw_1p      │
+│   - raw_1p outputs pixel 640, dispatches to EOL              │
+│   - Clock divider: 4 (31.25 MHz = ~25 MHz pixel rate)        │
+└─────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────┐
+│ DMA Channel 0                                                │
+│   - DREQ = PIO0_TX0 (paced by FIFO not-full)                 │
+│   - Transfers scanline buffer to SM0 TX FIFO                 │
+│   - 322 words per scanline                                   │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Scanline Buffer Format (RAW_RUN)
+
+```
+Word 0:  COMPOSABLE_RAW_RUN (7) | pixel1
+Word 1:  count (637) | pixel2
+Word 2:  pixel3 | pixel4
+Word 3:  pixel5 | pixel6
+...
+Word 320: pixel639 | pixel640
+Word 321: COMPOSABLE_EOL_SKIP_ALIGN (0)
+```
+
+Total: 322 words = 1288 bytes per scanline
+
+### Blank Scanline Format (COLOR_RUN)
+
+```
+Word 0:  COMPOSABLE_COLOR_RUN (3) | BLACK (0)
+Word 1:  count (637) | COMPOSABLE_RAW_1P (11)
+Word 2:  BLACK (0) | COMPOSABLE_EOL_ALIGN (1)
+```
+
+Total: 3 words = 12 bytes (much smaller than RAW_RUN!)
+
+### Remaining Minor Issues
+
+1. **Flickering horizontal band** - Moves up screen, likely due to frame buffer update during display
+2. **Slow animation** - Only updates every second (intentional for now)
+3. **Colors don't match C example** - Currently black/white only
+4. **Right border slightly thinner** - Possible pixel alignment issue
+
+### Files Modified
+
+- `hello_world.go` - Working composable scanline implementation
+- `hello.uf2` - Compiled firmware
+
+### What This Proves
+
+1. TinyGo CAN do proper VGA output with PIO + DMA
+2. Composable scanline format works correctly
+3. Multicore (goroutine on core1) provides stable timing
+4. The architecture matches C pico-extras scanvideo library

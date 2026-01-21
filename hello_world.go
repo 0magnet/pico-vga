@@ -1,9 +1,10 @@
-// Hello World demo using GVga library with PIO-based VGA output
-// Direct port of pico-extras scanvideo approach with DMA
+// Hello World demo - VGA 640x480@60Hz using pico-extras scanvideo architecture
+// This version closely follows the C pico-extras scanvideo implementation
 // Build with: tinygo build -target=pico -o hello.uf2 hello_world.go
 package main
 
 import (
+	"device/rp"
 	"machine"
 	"runtime/volatile"
 	"time"
@@ -12,344 +13,224 @@ import (
 	pio "github.com/tinygo-org/pio/rp2-pio"
 )
 
+// Pin assignments (Pimoroni VGA Demo Base)
 const (
 	pinHSYNC   = machine.GPIO16
 	pinVSYNC   = machine.GPIO17
 	pinRGBBase = machine.GPIO0
 )
 
-// VGA timing for 640x480@60Hz
+// VGA timing for 640x480@60Hz (standard VESA timing, matches C pico-extras non-48MHz mode)
 const (
-	vTotal      = 525
-	vSyncStart  = 490
-	vSyncEnd    = 492
+	hActive     = 640
+	hFrontPorch = 16
+	hPulse      = 96  // Standard VGA: 96 pixels
+	hTotal      = 800 // hActive(640) + hFrontPorch(16) + hPulse(96) + hBackPorch(48) = 800
+
+	vActive     = 480
+	vFrontPorch = 10  // Standard VGA: 10 lines
+	vPulse      = 2
+	vTotal      = 525 // Standard VGA: 525 lines
+
+	// Standard VGA polarities: NEGATIVE (active low) for both syncs
+	hSyncPolarity = 0 // Active low (standard VGA)
+	vSyncPolarity = 0 // Active low (standard VGA)
+)
+
+// Composable scanline command offsets - MUST match pico-extras video_24mhz_composable
+const (
+	COMPOSABLE_EOL_SKIP_ALIGN  = 0
+	COMPOSABLE_EOL_ALIGN       = 1
+	COMPOSABLE_RAW             = 2  // dispatch
+	COMPOSABLE_COLOR_RUN       = 3
+	COMPOSABLE_RAW_RUN         = 7
+	COMPOSABLE_RAW_1P          = 11
+	COMPOSABLE_RAW_2P          = 13
+	COMPOSABLE_RAW_1P_SKIP_ALIGN = 14
+)
+
+// Timing state command indices (match C enum)
+const (
+	SET_IRQ_0          = 0 // Active scanline IRQ
+	SET_IRQ_1          = 1 // Vblank scanline IRQ
+	SET_IRQ_SCANLINE   = 2 // IRQ 4 - triggers scanline SM
+	CLEAR_IRQ_SCANLINE = 3 // Clear IRQ 4
+)
+
+// Pre-encoded timing instructions
+var timingInstructions [4]uint16
+
+// Timing state (matches C timing_state struct)
+var timingState struct {
+	vActive     int32
+	vTotal      int32
+	vPulseStart int32
+	vPulseEnd   int32
+
+	vsyncBitsPulse   uint32
+	vsyncBitsNoPulse uint32
+
+	a, aVblank   uint32
+	b1, b2       uint32
+	c, cVblank   uint32
+
+	vsyncBits      uint32
+	dmaStateIndex  uint16
+	timingScanline int32
+}
+
+// DMA state array - 4 states per scanline (a, b1, b2, c)
+var dmaStates [4]uint32
+
+// Frame buffer (1bpp, 640x480 = 38400 bytes)
+const (
 	frameWidth  = 640
 	frameHeight = 480
 )
 
-// Color is RGB565 format
-type Color uint16
-
-// Standard colors (matching Pimoroni VGA Demo Base wiring)
-const (
-	colorBlack   Color = 0x0000
-	colorWhite   Color = 0xFFFF
-	colorRed     Color = 0x001F
-	colorGreen   Color = 0x07E0
-	colorBlue    Color = 0xF800
-	colorYellow  Color = 0x07FF
-	colorCyan    Color = 0xFFE0
-	colorMagenta Color = 0xF81F
-)
-
-// DMA registers
-const (
-	DMA_BASE = 0x50000000
-
-	// Channel 0 registers
-	DMA_CH0_READ_ADDR        = DMA_BASE + 0x000
-	DMA_CH0_WRITE_ADDR       = DMA_BASE + 0x004
-	DMA_CH0_TRANS_COUNT      = DMA_BASE + 0x008
-	DMA_CH0_CTRL_TRIG        = DMA_BASE + 0x00C
-	DMA_CH0_AL1_CTRL         = DMA_BASE + 0x010
-	DMA_CH0_AL3_TRANS_COUNT  = DMA_BASE + 0x038
-	DMA_CH0_AL3_READ_ADDR_TRIG = DMA_BASE + 0x03C
-
-	// DREQ values for PIO0
-	DREQ_PIO0_TX0 = 0
-	DREQ_PIO0_TX1 = 1
-)
-
-// DMA control register bits
-const (
-	DMA_CTRL_EN          = 1 << 0
-	DMA_CTRL_HIGH_PRIO   = 1 << 1
-	DMA_CTRL_DATA_SIZE_WORD = 2 << 2 // 32-bit transfers
-	DMA_CTRL_INCR_READ   = 1 << 4
-	DMA_CTRL_INCR_WRITE  = 0 << 5    // Don't increment write (PIO FIFO)
-	DMA_CTRL_TREQ_SEL_SHIFT = 15
-)
-
-var (
-	dmaCh0ReadAddr   = (*volatile.Register32)(unsafe.Pointer(uintptr(DMA_CH0_READ_ADDR)))
-	dmaCh0WriteAddr  = (*volatile.Register32)(unsafe.Pointer(uintptr(DMA_CH0_WRITE_ADDR)))
-	dmaCh0TransCount = (*volatile.Register32)(unsafe.Pointer(uintptr(DMA_CH0_TRANS_COUNT)))
-	dmaCh0CtrlTrig   = (*volatile.Register32)(unsafe.Pointer(uintptr(DMA_CH0_CTRL_TRIG)))
-	dmaCh0Al3TransCount = (*volatile.Register32)(unsafe.Pointer(uintptr(DMA_CH0_AL3_TRANS_COUNT)))
-	dmaCh0Al3ReadAddrTrig = (*volatile.Register32)(unsafe.Pointer(uintptr(DMA_CH0_AL3_READ_ADDR_TRIG)))
-)
-
-// Composable scanline command offsets (relative to PIO program start)
-// These will be adjusted by rgbOffset when building scanlines
-const (
-	LABEL_ENTRY_POINT   = 0  // entry_point / end_of_scanline_skip_ALIGN
-	LABEL_EOL_ALIGN     = 1  // end_of_scanline_ALIGN
-	LABEL_COLOR_RUN     = 3  // color_run
-	LABEL_RAW_RUN       = 7  // raw_run
-	LABEL_RAW_1P        = 11 // raw_1p
-	LABEL_RAW_2P        = 13 // raw_2p
-)
-
-// These are set after PIO program is loaded to include actual offset
-var (
-	COMPOSABLE_COLOR_RUN      uint16
-	COMPOSABLE_RAW_RUN        uint16
-	COMPOSABLE_RAW_1P         uint16
-	COMPOSABLE_RAW_2P         uint16
-	COMPOSABLE_EOL_SKIP_ALIGN uint16
-	COMPOSABLE_EOL_ALIGN      uint16
-)
-
-// Frame buffer for 1-bit graphics (640x480 = 38400 bytes)
 var frameBuffer [frameHeight][frameWidth / 8]byte
 
-// Palette for 1-bit mode
-var palette = [2]Color{colorBlack, colorWhite}
+// Palette lookup table: byte value (0-255) -> 8 RGB565 colors
+var paletteBuf [256 * 8]uint16
 
-// Scanline buffer for composable commands (double buffered)
-// Max size: 640 pixels + commands overhead = ~350 words worst case
-const scanlineBufSize = 400
-var scanlineBuf [2][scanlineBufSize]uint32
-var currentBuf int
+// Scanline buffers
+// RAW_RUN: 2 header words + 319 pixel pair words (638 pixels) + 1 EOL word = 322 words
+// Pixels 1-2 in header, pixels 3-640 in pairs, raw_1p fall-through outputs pixel 640
+const scanlineBufWords = 322
+var scanlineBufs [2][scanlineBufWords]uint32
 
-// Hello World animation state
-type helloState struct {
+// Blank scanline for vblank
+var blankScanline [3]uint32
+var blankScanlineLen int
+
+// PIO and state machines
+var (
+	videoPIO       *pio.PIO
+	timingSM       pio.StateMachine
+	scanlineSM     pio.StateMachine
+	timingOffset   uint8 // Program offset for timing SM
+	scanlineOffset uint8 // Program offset for scanline SM
+)
+
+// DMA channel registers
+type dmaChannel struct {
+	ReadAddr   volatile.Register32
+	WriteAddr  volatile.Register32
+	TransCount volatile.Register32
+	CtrlTrig   volatile.Register32
+}
+
+func getDMAChannel(ch int) *dmaChannel {
+	base := uintptr(0x50000000) + uintptr(ch)*0x40
+	return (*dmaChannel)(unsafe.Pointer(base))
+}
+
+// Animation state
+type animation struct {
 	x, y   int
 	dx, dy int
 }
 
-var hello = helloState{x: 100, y: 100, dx: 3, dy: 2}
-
-// PIO state machines
-var (
-	Pio     *pio.PIO
-	rgbSM   pio.StateMachine
-	hsyncSM pio.StateMachine
-)
+var anim = animation{x: 100, y: 100, dx: 2, dy: 1}
 
 func main() {
-	time.Sleep(2 * time.Second)
-	println("=== Hello World VGA Demo (DMA+PIO) ===")
+	time.Sleep(5 * time.Second)
+	println("=== VGA 640x480@60Hz Demo ===")
+	println("Following pico-extras scanvideo architecture")
 
 	led := machine.LED
 	led.Configure(machine.PinConfig{Mode: machine.PinOutput})
 	led.High()
 
-	// Configure sync pins
-	pinHSYNC.Configure(machine.PinConfig{Mode: machine.PinOutput})
-	pinVSYNC.Configure(machine.PinConfig{Mode: machine.PinOutput})
-	pinHSYNC.High()
-	pinVSYNC.High()
-
-	// Configure RGB pins
-	for pin := pinRGBBase; pin < pinRGBBase+16; pin++ {
-		pin.Configure(machine.PinConfig{Mode: machine.PinOutput})
-		pin.Low()
-	}
-
-	// Build PIO programs
-	Pio = pio.PIO0
-
-	// HSYNC program (generates timing and IRQ)
-	hsyncAsm := pio.AssemblerV0{}
-	hsyncProgram := []uint16{
-		hsyncAsm.Pull(false, true).Encode(),
-		hsyncAsm.Mov(pio.MovDestX, pio.MovSrcOSR).Encode(),
-		hsyncAsm.Jmp(pio.JmpXNZeroDec, 2).Encode(),
-		hsyncAsm.Set(pio.SetDestPins, 0).Delay(31).Encode(),
-		hsyncAsm.Set(pio.SetDestPins, 0).Delay(31).Encode(),
-		hsyncAsm.Set(pio.SetDestPins, 0).Delay(29).Encode(),
-		hsyncAsm.IRQSet(false, 0).Encode(), // IRQ 0 for CPU
-		hsyncAsm.IRQSet(false, 4).Encode(), // IRQ 4 for RGB SM
-		hsyncAsm.Set(pio.SetDestPins, 1).Encode(),
-		hsyncAsm.Jmp(pio.JmpAlways, 1).Encode(),
-	}
-
-	hsyncOffset, err := Pio.AddProgram(hsyncProgram, -1)
-	if err != nil {
-		println("Failed to load HSYNC program:", err.Error())
+	// Initialize video system
+	if !initVideo() {
+		println("Video init failed!")
 		blinkError(led)
 		return
 	}
-	println("HSYNC program at offset", hsyncOffset)
 
-	hsyncSM = Pio.StateMachine(0)
-	hsyncSM.TryClaim()
-
-	hsyncCfg := pio.DefaultStateMachineConfig()
-	hsyncCfg.SetSetPins(pinHSYNC, 1)
-	hsyncCfg.SetClkDivIntFrac(5, 0) // 25 MHz
-
-	pinHSYNC.Configure(machine.PinConfig{Mode: Pio.PinMode()})
-	hsyncSM.SetPindirsConsecutive(pinHSYNC, 1, true)
-	hsyncSM.Init(hsyncOffset, hsyncCfg)
-	hsyncSM.TxPut(1172) // Calibrated for ~31.4 kHz HSYNC
-
-	// RGB program - EXACT COPY from working main.go
-	rgbAsm := pio.AssemblerV0{}
-	rgbProgram := []uint16{
-		// Wait for IRQ 4 from HSYNC (start of back porch)
-		rgbAsm.WaitIRQ(true, false, 4).Encode(),           // 0: wait 1 irq 4
-
-		// Back porch - ~104 cycles with pins=0 (black)
-		rgbAsm.Set(pio.SetDestX, 25).Encode(),             // 1: set x, 25
-		rgbAsm.Mov(pio.MovDestPins, pio.MovSrcNull).Encode(), // 2: mov pins, null
-		rgbAsm.Jmp(pio.JmpXNZeroDec, 2).Encode(),          // 3: jmp x-- 2
-		rgbAsm.Set(pio.SetDestX, 25).Encode(),             // 4: another 50 cycles
-		rgbAsm.Nop().Encode(),                             // 5: nop (loop body)
-		rgbAsm.Jmp(pio.JmpXNZeroDec, 5).Encode(),          // 6: jmp x-- 5
-
-		// Active video - 7 color bars + 1 black bar
-		rgbAsm.Set(pio.SetDestY, 7).Encode(),              // 7: set y, 7 (7 bars)
-
-		rgbAsm.Pull(false, true).Encode(),                 // 8: pull block
-		rgbAsm.Mov(pio.MovDestPins, pio.MovSrcOSR).Encode(), // 9: mov pins, osr
-		rgbAsm.Set(pio.SetDestX, 6).Encode(),              // 10: set x, 6 (6 iterations)
-		rgbAsm.Nop().Delay(15).Encode(),                   // 11: nop [15] (16 cycles)
-		rgbAsm.Jmp(pio.JmpXNZeroDec, 11).Encode(),         // 12: jmp x-- 11 (6*17=102)
-		rgbAsm.Nop().Delay(2).Encode(),                    // 13: nop [2] (3 cycles)
-		rgbAsm.Jmp(pio.JmpYNZeroDec, 8).Encode(),          // 14: jmp y-- 8 (next bar)
-
-		// 8th bar (black) - same timing as color bars
-		rgbAsm.Mov(pio.MovDestPins, pio.MovSrcNull).Encode(), // 15: mov pins, null (BLACK)
-		rgbAsm.Set(pio.SetDestX, 6).Encode(),              // 16: set x, 6
-		rgbAsm.Nop().Delay(15).Encode(),                   // 17: nop [15]
-		rgbAsm.Jmp(pio.JmpXNZeroDec, 17).Encode(),         // 18: jmp x-- 17 (102 cycles)
-		rgbAsm.Nop().Delay(2).Encode(),                    // 19: nop [2] (3 cycles)
-
-		// Back to wait for next IRQ
-		rgbAsm.Jmp(pio.JmpAlways, 0).Encode(),             // 20: jmp 0
-	}
-
-	println("RGB program built, length:", len(rgbProgram))
-
-	rgbOffset, err := Pio.AddProgram(rgbProgram, -1)
-	if err != nil {
-		println("Failed to load RGB program:", err.Error())
-		blinkError(led)
-		return
-	}
-	println("RGB program at offset", rgbOffset)
-
-	// Initialize composable command offsets (absolute PIO addresses)
-	COMPOSABLE_COLOR_RUN = uint16(rgbOffset) + LABEL_COLOR_RUN
-	COMPOSABLE_RAW_RUN = uint16(rgbOffset) + LABEL_RAW_RUN
-	COMPOSABLE_RAW_1P = uint16(rgbOffset) + LABEL_RAW_1P
-	COMPOSABLE_RAW_2P = uint16(rgbOffset) + LABEL_RAW_2P
-	COMPOSABLE_EOL_SKIP_ALIGN = uint16(rgbOffset) + LABEL_ENTRY_POINT
-	COMPOSABLE_EOL_ALIGN = uint16(rgbOffset) + LABEL_EOL_ALIGN
-
-	println("Commands: COLOR_RUN=", COMPOSABLE_COLOR_RUN, "RAW_RUN=", COMPOSABLE_RAW_RUN,
-		"RAW_1P=", COMPOSABLE_RAW_1P, "RAW_2P=", COMPOSABLE_RAW_2P,
-		"EOL_ALIGN=", COMPOSABLE_EOL_ALIGN)
-
-	rgbSM = Pio.StateMachine(1)
-	rgbSM.TryClaim()
-
-	rgbCfg := pio.DefaultStateMachineConfig()
-	rgbCfg.SetOutPins(pinRGBBase, 16)
-	rgbCfg.SetClkDivIntFrac(5, 0) // 25 MHz
-	rgbCfg.SetOutShift(true, false, 32) // Shift right, no autopull
-	rgbCfg.SetFIFOJoin(pio.FifoJoinTx)
-
-	for pin := pinRGBBase; pin < pinRGBBase+16; pin++ {
-		pin.Configure(machine.PinConfig{Mode: Pio.PinMode()})
-	}
-	rgbSM.SetPindirsConsecutive(pinRGBBase, 16, true)
-	rgbSM.Init(rgbOffset, rgbCfg)
-
-	// Setup DMA channel 0 for scanline transfer
-	setupDMA()
-
-	// Debug: check frame buffer content
-	println("Checking frame buffer after draw...")
-	nonZeroBytes := 0
-	for y := 0; y < 10; y++ {
-		for x := 0; x < frameWidth/8; x++ {
-			if frameBuffer[y][x] != 0 {
-				nonZeroBytes++
-			}
-		}
-	}
-	println("Non-zero bytes in first 10 lines:", nonZeroBytes)
-	println("Sample FB[5][0]:", frameBuffer[5][0], "FB[100][10]:", frameBuffer[100][10])
-	println("Palette[0]=", palette[0], "Palette[1]=", palette[1])
-
-	// Start both state machines
-	hsyncSM.SetEnabled(true)
-	rgbSM.SetEnabled(true)
-	println("PIO state machines started")
-
-	// Clear frame buffer
+	// Initialize graphics
+	initPalette()
+	initBlankScanline()
 	clearScreen(0)
+	drawPattern()
 
-	// Draw initial content
-	drawHelloWorld()
+	// Pre-build first scanline
+	buildScanline(0, &scanlineBufs[0])
 
-	// Shared counters
+	// Enable video output
+	enableVideo(true)
+	println("Video enabled")
+
+	// Counters for frequency measurement (shared with goroutine via volatile)
 	var frameCount volatile.Register32
-	var lineCounter volatile.Register32
+	var hsyncCount volatile.Register32
+	var goroutineRunning volatile.Register32
 
-	// Render loop on core1 via goroutine
+	// Render loop runs on core1 via goroutine (TinyGo 0.38+ multicore support)
 	go func() {
-		lineCount := 0
+		goroutineRunning.Set(1)
+		line := 0
+		displayBuf := 0 // scanlineBufs[0] has scanline 0 pre-built
 
 		for {
-			// Wait for PIO IRQ 0 (line complete)
-			for Pio.GetIRQ()&1 == 0 {
-			}
-			Pio.ClearIRQ(1)
+			goroutineRunning.Set(goroutineRunning.Get() + 1)
+			// Keep timing FIFO fed
+			topUpTimingFIFO()
 
-			lineCount++
-			lineCounter.Set(lineCounter.Get() + 1)
+			// Check for scanline IRQs
+			irqs := videoPIO.GetIRQ()
 
-			// Sample frame buffer at 7 horizontal positions + black
-			if lineCount > 0 && lineCount <= frameHeight {
-				scanline := lineCount - 1
-				fbRow := frameBuffer[scanline][:]
-				// Sample at 7 positions across the line
-				for i := 0; i < 7; i++ {
-					bytePos := i * 10 // Sample every ~80 pixels
-					b := fbRow[bytePos]
-					bit := (b >> 7) & 1
-					rgbSM.TxPut(uint32(palette[bit]))
+			if irqs&1 != 0 {
+				// IRQ 0: Active scanline
+				videoPIO.ClearIRQ(1)
+				hsyncCount.Set(hsyncCount.Get() + 1)
+
+				// Transfer scanline data via DMA from display buffer
+				if line >= 0 && line < frameHeight {
+					startDMA(unsafe.Pointer(&scanlineBufs[displayBuf][0]), scanlineBufWords)
+				} else {
+					startDMA(unsafe.Pointer(&blankScanline[0]), blankScanlineLen)
 				}
-				rgbSM.TxPut(0) // 8th = black
-			} else {
-				// Vertical blanking - all black
-				for i := 0; i < 8; i++ {
-					rgbSM.TxPut(0)
+
+				// Build next scanline into the other buffer while DMA runs
+				nextLine := line + 1
+				if nextLine >= 0 && nextLine < frameHeight {
+					buildBuf := 1 - displayBuf
+					buildScanline(nextLine, &scanlineBufs[buildBuf])
+					displayBuf = buildBuf // swap for next iteration
 				}
+
+				line++
 			}
 
-			// Handle VSYNC
-			if lineCount == vSyncStart {
-				pinVSYNC.Low()
-			} else if lineCount == vSyncEnd {
-				pinVSYNC.High()
-			} else if lineCount >= vTotal {
-				lineCount = 0
+			if irqs&2 != 0 {
+				// IRQ 1: Vblank scanline
+				videoPIO.ClearIRQ(2)
+				hsyncCount.Set(hsyncCount.Get() + 1)
+
+				// During vblank, just send blank scanlines
+				startDMA(unsafe.Pointer(&blankScanline[0]), blankScanlineLen)
+				line++
+			}
+
+			// Frame boundary
+			if line >= vTotal {
+				line = 0
 				frameCount.Set(frameCount.Get() + 1)
-				// Swap buffers at frame boundary
-				currentBuf = 1 - currentBuf
+				// Build scanline 0 for next frame
+				buildScanline(0, &scanlineBufs[displayBuf])
 			}
 		}
 	}()
 
-	println("Render loop started")
+	println("Render loop running on core1")
+	println("Press 'r' to reboot to BOOTSEL")
 
-	// Main loop - animation and status
+	// Main loop on core0: status display and animation (doesn't affect timing)
+	lastHsync := uint32(0)
 	lastFrame := uint32(0)
-	var lastLineCount volatile.Register32
-
-	// Track line rate in render goroutine
-	go func() {
-		for {
-			time.Sleep(time.Second)
-			lastLineCount.Set(lineCounter.Get())
-			lineCounter.Set(0)
-		}
-	}()
+	lastTime := time.Now()
 
 	for {
 		time.Sleep(time.Second)
@@ -358,208 +239,502 @@ func main() {
 		if machine.Serial.Buffered() > 0 {
 			b, _ := machine.Serial.ReadByte()
 			if b == 'r' || b == 'R' {
-				println("Rebooting to BOOTSEL...")
+				println("Rebooting...")
 				time.Sleep(100 * time.Millisecond)
-				rebootToBootsel()
+				machine.EnterBootloader()
 			}
 		}
 
-		// Animate
-		eraseHelloWorld()
-		moveHelloWorld()
-		drawHelloWorld()
+		// Calculate frequencies
+		now := time.Now()
+		elapsedMs := now.Sub(lastTime).Milliseconds()
+		if elapsedMs == 0 {
+			elapsedMs = 1
+		}
 
-		// Report timing info
+		h := hsyncCount.Get()
 		f := frameCount.Get()
-		lines := lastLineCount.Get()
 
-		// Sample what we'd push for line 100
-		fbRow := frameBuffer[100][:]
-		var sampleColors [7]uint32
-		for i := 0; i < 7; i++ {
-			bytePos := i * 10
-			b := fbRow[bytePos]
-			bit := (b >> 7) & 1
-			sampleColors[i] = uint32(palette[bit])
+		hsyncDelta := h - lastHsync
+		frameDelta := f - lastFrame
+
+		hsyncHz := (hsyncDelta * 1000) / uint32(elapsedMs)
+		vsyncHz := (frameDelta * 1000) / uint32(elapsedMs)
+		linesPerFrame := uint32(0)
+		if frameDelta > 0 {
+			linesPerFrame = hsyncDelta / frameDelta
 		}
 
-		println("Frame:", f, "Lines/sec:", lines, "VSYNC~", f-lastFrame, "Hz")
-		println("Line100 colors:", sampleColors[0], sampleColors[1], sampleColors[2], sampleColors[3])
+		println("HSYNC:", hsyncHz, "Hz  VSYNC:", vsyncHz, "Hz  Lines:", linesPerFrame)
+		println("  Target: HSYNC=31468 Hz, VSYNC=60 Hz, Lines=525")
+		println("  SM0 PC:", rp.PIO0.SM0_ADDR.Get(), "SM3 PC:", rp.PIO0.SM3_ADDR.Get())
+		println("  TxFull:", timingSM.IsTxFIFOFull(), "TxEmpty:", timingSM.IsTxFIFOEmpty())
+		println("  PIO IRQ:", videoPIO.GetIRQ())
+		println("  Goroutine iterations:", goroutineRunning.Get())
+
+		lastHsync = h
 		lastFrame = f
+		lastTime = now
+
+		// Update animation
+		clearScreen(0)
+		anim.x += anim.dx
+		anim.y += anim.dy
+		if anim.x < 10 || anim.x > frameWidth-160 {
+			anim.dx = -anim.dx
+		}
+		if anim.y < 10 || anim.y > frameHeight-80 {
+			anim.dy = -anim.dy
+		}
+		drawPattern()
 	}
 }
 
-// rebootToBootsel reboots the Pico into BOOTSEL mode
-func rebootToBootsel() {
-	// RP2040 ROM provides reset_usb_boot at a known location
-	// We can find it via rom_hword_as_ptr(0x14) to get function table,
-	// then rom_hword_as_ptr(0x18) to get lookup function
+// initVideo sets up PIO and DMA for video output
+func initVideo() bool {
+	videoPIO = pio.PIO0
 
-	// Read pointers from ROM header
-	fnTable := uintptr(*(*uint16)(unsafe.Pointer(uintptr(0x14))))
-	lookupFn := uintptr(*(*uint16)(unsafe.Pointer(uintptr(0x18))))
+	// Build timing instructions (IRQ instructions executed via out exec)
+	asm := pio.AssemblerV0{}
+	timingInstructions[SET_IRQ_0] = asm.IRQSet(false, 0).Encode()
+	timingInstructions[SET_IRQ_1] = asm.IRQSet(false, 1).Encode()
+	timingInstructions[SET_IRQ_SCANLINE] = asm.IRQSet(false, 4).Encode()
+	timingInstructions[CLEAR_IRQ_SCANLINE] = asm.IRQClear(false, 4).Encode()
 
-	println("ROM fn table:", fnTable, "lookup fn:", lookupFn)
+	// Initialize timing state values
+	initTimingState()
 
-	// The lookup function: void* rom_table_lookup(uint16_t *table, uint32_t code)
-	// Code for reset_usb_boot is 'UB' = 0x4255
+	// Load composable scanline program (MUST be at offset 0)
+	scanlineProgram := buildScanlineProgram()
+	println("Scanline program (", len(scanlineProgram), "instructions):")
+	for i, instr := range scanlineProgram {
+		println("  [", i, "]:", hex(uint32(instr)))
+	}
+	offset, err := videoPIO.AddProgram(scanlineProgram, 0)
+	if err != nil {
+		println("Failed to load scanline program at offset 0:", err.Error())
+		return false
+	}
+	scanlineOffset = offset
+	println("Scanline program at offset", scanlineOffset)
 
-	// Instead of complex function pointer casting, use rom_func_lookup directly
-	// by reading rom_table_lookup's code and calling it
+	// Load timing program at fixed offset 16 (scanline uses 0-15)
+	const timingProgramOffsetVal = 16
+	timingProgram := buildTimingProgram() // JMP targets are relative, library adds offset
+	println("Timing program (", len(timingProgram), "instructions):")
+	for i, instr := range timingProgram {
+		println("  [", timingProgramOffsetVal+i, "]:", hex(uint32(instr)))
+	}
+	offset, err = videoPIO.AddProgram(timingProgram, timingProgramOffsetVal)
+	if err != nil {
+		println("Failed to load timing program:", err.Error())
+		return false
+	}
+	timingOffset = offset
+	println("Timing program at offset", timingOffset)
 
-	// Actually, let's try the simplest approach: the ROM has reset_usb_boot
-	// and we can scan for it or use a known offset
+	// Configure scanline SM (SM0)
+	scanlineSM = videoPIO.StateMachine(0)
+	scanlineSM.TryClaim()
 
-	// For RP2040, reset_usb_boot is typically near the start of ROM functions
-	// Try calling rom_table_lookup manually
+	scanlineCfg := pio.DefaultStateMachineConfig()
+	scanlineCfg.SetOutPins(pinRGBBase, 16)
+	scanlineCfg.SetOutShift(true, true, 32) // Shift right, autopull
+	scanlineCfg.SetFIFOJoin(pio.FifoJoinTx) // 8-deep TX FIFO
+	scanlineCfg.SetClkDivIntFrac(4, 0)       // Match timing SM clock divider
 
-	// Build the lookup call using raw pointers
-	type lookupType func(table uintptr, code uint32) uintptr
+	for pin := pinRGBBase; pin < pinRGBBase+16; pin++ {
+		pin.Configure(machine.PinConfig{Mode: videoPIO.PinMode()})
+	}
+	scanlineSM.SetPindirsConsecutive(pinRGBBase, 16, true)
+	scanlineSM.Init(scanlineOffset+1, scanlineCfg) // Start at entry point (wait IRQ)
 
-	// The lookup function pointer needs Thumb bit set
-	lookupPtr := lookupFn | 1
-	lookup := *(*lookupType)(unsafe.Pointer(&lookupPtr))
+	// Configure timing SM (SM3)
+	timingSM = videoPIO.StateMachine(3)
+	timingSM.TryClaim()
 
-	// Look up reset_usb_boot (code 'UB' = 0x4255)
-	code := uint32('U') | (uint32('B') << 8)
-	resetFnAddr := lookup(fnTable, code)
+	timingCfg := pio.DefaultStateMachineConfig()
+	timingCfg.SetOutPins(pinHSYNC, 2)         // HSYNC, VSYNC as OUT pins
+	timingCfg.SetOutShift(true, true, 32)     // Shift right, autopull
+	timingCfg.SetClkDivIntFrac(4, 0)          // 31.25 MHz to compensate for timing loop overhead
+	// Set wrap points: wrap from end of jmp (21) back to new_state (17)
+	// TinyGo SetWrap takes (target, top) - the address to wrap TO first, then wrap FROM
+	wrapBottom := timingOffset + timingWrapTarget // 17
+	wrapTop := timingOffset + timingWrapEnd       // 21
+	println("Setting timing wrap: bottom=", wrapBottom, "top=", wrapTop)
+	timingCfg.SetWrap(wrapBottom, wrapTop)
 
-	println("reset_usb_boot found at:", resetFnAddr)
+	pinHSYNC.Configure(machine.PinConfig{Mode: videoPIO.PinMode()})
+	pinVSYNC.Configure(machine.PinConfig{Mode: videoPIO.PinMode()})
+	timingSM.SetPindirsConsecutive(pinHSYNC, 2, true)
+	timingSM.Init(timingOffset, timingCfg)
 
-	if resetFnAddr == 0 {
-		println("ERROR: Could not find reset_usb_boot")
-		// Try direct watchdog reset as fallback
-		watchdogReset()
-		return
+	// Debug: verify wrap was set correctly
+	execctrl := rp.PIO0.SM3_EXECCTRL.Get()
+	actualTop := (execctrl >> 12) & 0x1F
+	actualBottom := (execctrl >> 7) & 0x1F
+	println("After Init - SM3 EXECCTRL wrap: bottom=", actualBottom, "top=", actualTop)
+
+	// Debug: verify clock divider
+	clkdiv := rp.PIO0.SM3_CLKDIV.Get()
+	clkdivInt := (clkdiv >> 16) & 0xFFFF
+	clkdivFrac := (clkdiv >> 8) & 0xFF
+	println("After Init - SM3 CLKDIV: int=", clkdivInt, "frac=", clkdivFrac)
+
+	// Configure DMA
+	setupDMA()
+
+	return true
+}
+
+// initTimingState initializes timing state values (matches C init_timing_state)
+func initTimingState() {
+	timingState.vTotal = vTotal
+	timingState.vActive = vActive
+	timingState.vPulseStart = int32(vActive + vFrontPorch)
+	timingState.vPulseEnd = timingState.vPulseStart + vPulse
+
+	// VSYNC bit in timing word (bit 30 -> pin bit 1 after shift)
+	const vsyncBit = 0x40000000
+
+	// VSYNC polarity handling (matches C code EXACTLY)
+	// C code: vsync_bits_pulse = timing->v_sync_polarity ? 0 : vsync_bit;
+	// C code: vsync_bits_no_pulse = timing->v_sync_polarity ? vsync_bit : 0;
+	if vSyncPolarity != 0 {
+		// Active high: during pulse output LOW (0), outside pulse output HIGH (vsyncBit)
+		timingState.vsyncBitsPulse = 0
+		timingState.vsyncBitsNoPulse = vsyncBit
+	} else {
+		// Active low: during pulse output HIGH (vsyncBit), outside pulse output LOW (0)
+		timingState.vsyncBitsPulse = vsyncBit
+		timingState.vsyncBitsNoPulse = 0
 	}
 
-	// Call reset_usb_boot(0, 0)
-	type resetType func(gpioMask, disableMask uint32)
-	resetPtr := resetFnAddr | 1 // Thumb bit
-	reset := *(*resetType)(unsafe.Pointer(&resetPtr))
-
-	println("Calling reset_usb_boot(0, 0)...")
-	reset(0, 0)
-
-	for {
+	// HSYNC bit (bit 29 -> pin bit 0)
+	var hSyncBit uint32
+	if hSyncPolarity == 0 {
+		hSyncBit = 1 // Active low: output 1 during pulse (inverted)
+	} else {
+		hSyncBit = 0 // Active high: output 0 during pulse (inverted)
 	}
+	hSyncNoBit := 1 - hSyncBit
+
+	// Calculate back porch
+	hBackPorch := hTotal - hActive - hFrontPorch - hPulse
+	hActiveAndFront := hActive + hFrontPorch
+
+	// Encode timing states (matches C timing_encode macro)
+	// Format: instruction(16) | (cycles-3)(13) | pins(3)
+	timingState.a = timingEncode(SET_IRQ_0, 4, hSyncBit)
+	timingState.aVblank = timingEncode(SET_IRQ_1, 4, hSyncBit)
+	timingState.b1 = timingEncode(CLEAR_IRQ_SCANLINE, hPulse-4, hSyncBit)
+	timingState.b2 = timingEncode(CLEAR_IRQ_SCANLINE, hBackPorch, hSyncNoBit)
+	timingState.c = timingEncode(SET_IRQ_SCANLINE, hActiveAndFront, 4|hSyncNoBit) // DEN bit
+	timingState.cVblank = timingEncode(CLEAR_IRQ_SCANLINE, hActiveAndFront, hSyncNoBit)
+
+	// Initialize state
+	setupDmaStatesVblank()
+	timingState.vsyncBits = timingState.vsyncBitsNoPulse
+	timingState.dmaStateIndex = 0
+	timingState.timingScanline = 0
+
+	println("Timing states (hex):")
+	println("  a:", hex(timingState.a), "a_vblank:", hex(timingState.aVblank))
+	println("  b1:", hex(timingState.b1), "b2:", hex(timingState.b2))
+	println("  c:", hex(timingState.c), "c_vblank:", hex(timingState.cVblank))
+	println("IRQ instructions (hex):")
+	println("  SET_IRQ_0:", hex(uint32(timingInstructions[SET_IRQ_0])))
+	println("  SET_IRQ_1:", hex(uint32(timingInstructions[SET_IRQ_1])))
+	println("  SET_IRQ_SCANLINE:", hex(uint32(timingInstructions[SET_IRQ_SCANLINE])))
+	println("  CLEAR_IRQ_SCANLINE:", hex(uint32(timingInstructions[CLEAR_IRQ_SCANLINE])))
 }
 
-// watchdogReset triggers a watchdog reset as fallback
-func watchdogReset() {
-	println("Trying watchdog reset...")
-
-	// Watchdog registers
-	const WATCHDOG_BASE = 0x40058000
-	ctrl := (*volatile.Register32)(unsafe.Pointer(uintptr(WATCHDOG_BASE + 0x00)))
-	scratch0 := (*volatile.Register32)(unsafe.Pointer(uintptr(WATCHDOG_BASE + 0x0C)))
-
-	// Set magic value that bootrom checks for USB boot
-	scratch0.Set(0xB007C0DE)
-
-	// Trigger watchdog with very short timeout
-	// CTRL: bits 30:31 = TRIGGER, bit 24 = ENABLE
-	ctrl.Set(1 << 30) // Trigger
-
-	for {
+func hex(v uint32) string {
+	digits := "0123456789ABCDEF"
+	result := make([]byte, 10)
+	result[0] = '0'
+	result[1] = 'x'
+	for i := 0; i < 8; i++ {
+		result[9-i] = digits[v&0xF]
+		v >>= 4
 	}
+	return string(result)
 }
 
-// setupDMA configures DMA channel 0 for PIO TX transfers
-func setupDMA() {
-	// Get PIO0 TX FIFO address for SM1
-	pioTxFifo := uintptr(0x50200000 + 0x10 + 1*4) // PIO0_BASE + TXF0 + SM1 offset
-
-	// Configure DMA channel 0
-	ctrl := uint32(DMA_CTRL_EN |
-		DMA_CTRL_DATA_SIZE_WORD |
-		DMA_CTRL_INCR_READ |
-		(DREQ_PIO0_TX1 << DMA_CTRL_TREQ_SEL_SHIFT))
-
-	dmaCh0WriteAddr.Set(uint32(pioTxFifo))
-	dmaCh0CtrlTrig.Set(ctrl & ^uint32(DMA_CTRL_EN)) // Configure but don't enable yet
-
-	println("DMA configured, write addr:", pioTxFifo)
+func timingEncode(cmd int, cycles int, pins uint32) uint32 {
+	// TIMING_CYCLE = 3 matches C pico-extras exactly
+	// The timing formula is complex due to the 2-cycle loop
+	const TIMING_CYCLE = 3
+	return uint32(timingInstructions[cmd]) | (uint32(cycles-TIMING_CYCLE) << 16) | (pins << 29)
 }
 
-// startDMATransfer starts a DMA transfer of the scanline buffer
-func startDMATransfer(wordCount int) {
-	buf := &scanlineBuf[currentBuf]
-	readAddr := uintptr(unsafe.Pointer(&buf[0]))
-
-	// Set read address and count, then trigger
-	dmaCh0ReadAddr.Set(uint32(readAddr))
-	dmaCh0TransCount.Set(uint32(wordCount))
-
-	// Enable and trigger
-	ctrl := dmaCh0CtrlTrig.Get()
-	dmaCh0CtrlTrig.Set(ctrl | DMA_CTRL_EN)
+// encodeJmp creates a PIO JMP always instruction to the given address
+func encodeJmp(addr uint8) uint16 {
+	// JMP instruction: bits 15-13=000, bits 12-8=condition (000=always), bits 4-0=address
+	return uint16(addr & 0x1F)
 }
 
-// buildScanlineComposable builds a composable scanline from frame buffer
-// Returns the number of 32-bit words in the buffer
-func buildScanlineComposable(line int) int {
-	buf := &scanlineBuf[currentBuf]
-	idx := 0
-	fbRow := frameBuffer[line][:]
+func setupDmaStatesVblank() {
+	dmaStates[0] = timingState.aVblank
+	dmaStates[1] = timingState.b1
+	dmaStates[2] = timingState.b2
+	dmaStates[3] = timingState.cVblank
+}
 
-	// Build pixel array from frame buffer
-	var pixels [frameWidth]Color
-	for byteIdx := 0; byteIdx < frameWidth/8; byteIdx++ {
-		b := fbRow[byteIdx]
-		basePixel := byteIdx * 8
-		for bit := 0; bit < 8; bit++ {
-			pixelBit := (b >> (7 - bit)) & 1
-			pixels[basePixel+bit] = palette[pixelBit]
+func setupDmaStatesActive() {
+	dmaStates[0] = timingState.a
+	dmaStates[1] = timingState.b1
+	dmaStates[2] = timingState.b2
+	dmaStates[3] = timingState.c
+}
+
+// topUpTimingFIFO feeds timing data to timing SM (matches C top_up_timing_pio_fifo)
+func topUpTimingFIFO() {
+	// Fill while TX FIFO has space
+	for !timingSM.IsTxFIFOFull() {
+		timingSM.TxPut(dmaStates[timingState.dmaStateIndex] | timingState.vsyncBits)
+
+		timingState.dmaStateIndex++
+		if timingState.dmaStateIndex >= 4 {
+			timingState.dmaStateIndex = 0
+			timingState.timingScanline++
+
+			// Vertical timing state transitions
+			if timingState.timingScanline >= timingState.vActive {
+				if timingState.timingScanline >= timingState.vTotal {
+					timingState.timingScanline = 0
+					setupDmaStatesActive()
+				} else if timingState.timingScanline == timingState.vActive {
+					setupDmaStatesVblank()
+				} else if timingState.timingScanline == timingState.vPulseStart {
+					timingState.vsyncBits = timingState.vsyncBitsPulse
+				} else if timingState.timingScanline == timingState.vPulseEnd {
+					timingState.vsyncBits = timingState.vsyncBitsNoPulse
+				}
+			}
 		}
 	}
-
-	// Use RAW_RUN for the entire line (simplest approach)
-	// Format: | RAW_RUN | first_color | count | second_color | ... pairs ... |
-
-	// RAW_RUN: | cmd | first_color |
-	buf[idx] = uint32(COMPOSABLE_RAW_RUN) | (uint32(pixels[0]) << 16)
-	idx++
-
-	// | count-1 | second_color |
-	// RAW_RUN outputs 'count' additional pixels after the first
-	// count value is actually count-1 in the loop (jmp x-- 9)
-	buf[idx] = uint32(frameWidth-3) | (uint32(pixels[1]) << 16)
-	idx++
-
-	// Output remaining pixels in pairs (pixels 2 through frameWidth-2)
-	for pixelIdx := 2; pixelIdx < frameWidth-1; pixelIdx += 2 {
-		buf[idx] = uint32(pixels[pixelIdx]) | (uint32(pixels[pixelIdx+1]) << 16)
-		idx++
-	}
-
-	// End with RAW_1P for last pixel and EOL
-	buf[idx] = uint32(COMPOSABLE_RAW_1P) | (uint32(pixels[frameWidth-1]) << 16)
-	idx++
-	buf[idx] = uint32(COMPOSABLE_EOL_ALIGN) | (uint32(0) << 16)
-	idx++
-
-	return idx
 }
 
-// buildBlackLine builds a black scanline using COLOR_RUN
-func buildBlackLine() int {
-	buf := &scanlineBuf[currentBuf]
-	idx := 0
+// buildTimingProgram creates timing PIO program
+// Note: JMP targets are RELATIVE to program start (0-based within program)
+// The TinyGo PIO library automatically adds the load offset to JMP targets
+//
+// Match C pico-extras timing.pio EXACTLY:
+// - 2-cycle loop (nop + jmp) like the C code
+// - This ensures timing matches the C implementation
+func buildTimingProgram() []uint16 {
+	asm := pio.AssemblerV0{}
+	return []uint16{
+		asm.Pull(false, true).Encode(),          // 0: entry_point - pull block
+		// .wrap_target here (relative offset 1)
+		asm.Out(pio.OutDestExec, 16).Encode(),   // 1: new_state - execute IRQ instruction
+		asm.Out(pio.OutDestX, 13).Encode(),      // 2: load cycle count into X
+		asm.Out(pio.OutDestPins, 3).Encode(),    // 3: output sync pins (HSYNC, VSYNC)
+		// loop: 2-cycle delay (nop + jmp) - matches C timing.pio exactly
+		asm.Nop().Encode(),                      // 4: nop
+		asm.Jmp(pio.JmpXNZeroDec, 4).Encode(),   // 5: jmp x-- loop (to nop at relative offset 4)
+		// .wrap here (back to relative offset 1)
+	}
+}
 
-	// COLOR_RUN: | cmd | color | count-3 | next_cmd |
-	buf[idx] = uint32(COMPOSABLE_COLOR_RUN) | (uint32(colorBlack) << 16)
-	idx++
-	buf[idx] = uint32(frameWidth-5) | (uint32(COMPOSABLE_RAW_2P) << 16)
-	idx++
-	buf[idx] = uint32(colorBlack) | (uint32(colorBlack) << 16) // Two black pixels
-	idx++
-	buf[idx] = uint32(COMPOSABLE_RAW_1P) | (uint32(colorBlack) << 16) // Final pixel
-	idx++
-	buf[idx] = uint32(COMPOSABLE_EOL_ALIGN) | (uint32(0) << 16) // EOL
-	idx++
+// Timing program wrap points (relative to program start)
+const (
+	timingWrapTarget = 1 // new_state (out exec) - where wrap goes TO
+	timingWrapEnd    = 5 // jmp x-- loop - where wrap happens FROM (6-instruction program: 0-5)
+)
 
-	return idx
+// buildScanlineProgram creates composable scanline PIO program
+func buildScanlineProgram() []uint16 {
+	asm := pio.AssemblerV0{}
+	return []uint16{
+		asm.Out(pio.OutDestNull, 32).Encode(), // 0: end_of_scanline_skip_ALIGN
+		asm.WaitIRQ(true, false, 4).Encode(),  // 1: entry_point - wait for IRQ 4
+		asm.Out(pio.OutDestPC, 16).Encode(),   // 2: dispatch
+
+		// color_run (3-6)
+		asm.Out(pio.OutDestPins, 16).Encode(), // 3: output color
+		asm.Out(pio.OutDestX, 16).Encode(),    // 4: load count
+		asm.Jmp(pio.JmpXNZeroDec, 5).Encode(), // 5: color_loop
+		asm.Out(pio.OutDestPC, 16).Encode(),   // 6: next command
+
+		// raw_run (7-10)
+		asm.Out(pio.OutDestPins, 16).Encode(), // 7: first pixel
+		asm.Out(pio.OutDestX, 16).Encode(),    // 8: load count
+		asm.Out(pio.OutDestPins, 16).Encode(), // 9: pixel_loop
+		asm.Jmp(pio.JmpXNZeroDec, 9).Encode(), // 10: loop
+
+		// raw_1p (11-12)
+		asm.Out(pio.OutDestPins, 16).Encode(), // 11: output pixel
+		asm.Out(pio.OutDestPC, 16).Encode(),   // 12: next command
+
+		// raw_2p (13) - wraps to 11
+		asm.Out(pio.OutDestPins, 16).Encode(), // 13: first pixel
+
+		// raw_1p_skip_ALIGN (14-15)
+		asm.Out(pio.OutDestPins, 32).Encode(), // 14: skip align
+		asm.Out(pio.OutDestPC, 16).Encode(),   // 15: next command
+	}
+}
+
+// enableVideo starts/stops video output
+func enableVideo(enable bool) {
+	// Disable SMs first
+	timingSM.SetEnabled(false)
+	scanlineSM.SetEnabled(false)
+
+	if enable {
+		println("Enabling video...")
+		println("  timingOffset:", timingOffset, "scanlineOffset:", scanlineOffset)
+
+		// Prime timing FIFO
+		for i := 0; i < 8; i++ {
+			topUpTimingFIFO()
+		}
+		println("  FIFO primed, TxFull:", timingSM.IsTxFIFOFull())
+
+		// Enable IRQ sources first
+		rp.PIO0.IRQ0_INTE.SetBits(0x03)                  // IRQ 0 and IRQ 1
+		rp.PIO0.IRQ1_INTE.SetBits(1 << (8 + 3))          // SM3 TX not full
+
+		// Clear any pending IRQs
+		videoPIO.ClearIRQ(0xFF)
+
+		// Force SMs to correct entry points before enabling
+		println("  Before Exec: SM3 PC =", rp.PIO0.SM3_ADDR.Get())
+		println("  JMP target:", timingOffset, "encoded:", hex(uint32(encodeJmp(timingOffset))))
+
+		scanlineSM.Exec(encodeJmp(scanlineOffset + 1)) // Wait IRQ instruction at offset 1
+		timingSM.Exec(encodeJmp(timingOffset))         // Pull instruction at timing offset
+
+		println("  After Exec: SM3 PC =", rp.PIO0.SM3_ADDR.Get())
+
+		// Enable SMs
+		timingSM.SetEnabled(true)
+		scanlineSM.SetEnabled(true)
+
+		println("  After Enable: SM3 PC =", rp.PIO0.SM3_ADDR.Get())
+
+		println("  SMs enabled, checking IRQs...")
+		time.Sleep(10 * time.Millisecond)
+		println("  PIO IRQ after 10ms:", videoPIO.GetIRQ())
+		println("  TxFull after 10ms:", timingSM.IsTxFIFOFull())
+
+		// Read PIO control register directly
+		pioCtrl := rp.PIO0.CTRL.Get()
+		println("  PIO0 CTRL:", hex(pioCtrl))
+		println("  SM3 enabled bit:", (pioCtrl>>3)&1)
+
+		// Read SM3 ADDR (current PC)
+		pioAddr := rp.PIO0.SM3_ADDR.Get()
+		println("  SM3 ADDR (PC):", pioAddr)
+	}
+}
+
+// setupDMA configures DMA channel 0 for scanline transfer
+func setupDMA() {
+	// Enable DMA
+	rp.RESETS.RESET.ClearBits(rp.RESETS_RESET_DMA)
+	for !rp.RESETS.RESET_DONE.HasBits(rp.RESETS_RESET_DONE_DMA) {
+	}
+
+	dma := getDMAChannel(0)
+	txFifo := uint32(0x50200010) // PIO0 TXF0 (SM0)
+
+	ctrl := uint32(0)
+	ctrl |= 1 << 0                 // Enable
+	ctrl |= 1 << 1                 // High priority
+	ctrl |= 2 << 2                 // 32-bit transfers
+	ctrl |= 1 << 4                 // Increment read address
+	ctrl |= 0 << 15                // DREQ = PIO0_TX0
+
+	dma.WriteAddr.Set(txFifo)
+	dma.CtrlTrig.Set(ctrl & ^uint32(1)) // Configure but don't start
+
+	println("DMA configured for SM0")
+}
+
+func startDMA(buf unsafe.Pointer, count int) {
+	dma := getDMAChannel(0)
+	// Don't wait for previous transfer - DREQ pacing handles flow control
+	// Waiting would cause deadlock: DMA waits for SM0, SM0 waits for SM3's IRQ4
+	dma.ReadAddr.Set(uint32(uintptr(buf)))
+	dma.TransCount.Set(uint32(count))
+	dma.CtrlTrig.SetBits(1) // Start
+}
+
+// Palette and scanline building
+
+func initPalette() {
+	colors := [2]uint16{0x0000, 0xFFFF} // Black, White
+	for i := 0; i < 256; i++ {
+		for j := 0; j < 8; j++ {
+			bit := 1 << (7 - j)
+			idx := 0
+			if i&bit != 0 {
+				idx = 1
+			}
+			paletteBuf[i*8+j] = colors[idx]
+		}
+	}
+	println("Palette initialized")
+}
+
+func initBlankScanline() {
+	// Use COLOR_RUN format matching C pico-extras _missing_scanline_data
+	// COLOR_RUN outputs a single color for (count+3) pixel periods without needing pixel data
+	// Format: COLOR_RUN | color | count-3 | RAW_1P | black | EOL_ALIGN
+	blankScanline[0] = uint32(COMPOSABLE_COLOR_RUN) | (0 << 16)                    // COLOR_RUN | BLACK
+	blankScanline[1] = uint32(frameWidth-3) | (uint32(COMPOSABLE_RAW_1P) << 16)    // count | RAW_1P
+	blankScanline[2] = 0 | (uint32(COMPOSABLE_EOL_ALIGN) << 16)                    // BLACK | EOL_ALIGN
+	blankScanlineLen = 3
+	println("Blank scanline initialized (COLOR_RUN format)")
+}
+
+func buildScanline(line int, buf *[scanlineBufWords]uint32) {
+	row := frameBuffer[line][:]
+	ptr := 0
+
+	// RAW_RUN format: | jmp raw_run | pixel1 | count | pixel2 | <count more pixels> |
+	// With count = frameWidth-3 = 637, RAW_RUN outputs 639 pixels (1 + 638 from loop)
+	// After loop, raw_1p fall-through outputs pixel 640 from OSR, then dispatches to EOL
+
+	// First byte provides pixels 1-8
+	b := row[0]
+	colors := paletteBuf[int(b)*8:]
+
+	// Word 0: RAW_RUN cmd | pixel 1
+	buf[ptr] = uint32(COMPOSABLE_RAW_RUN) | (uint32(colors[0]) << 16)
+	ptr++
+	// Word 1: count | pixel 2
+	buf[ptr] = uint32(frameWidth-3) | (uint32(colors[1]) << 16)
+	ptr++
+	// Words 2-3: pixels 3-6
+	buf[ptr] = uint32(colors[2]) | (uint32(colors[3]) << 16)
+	ptr++
+	buf[ptr] = uint32(colors[4]) | (uint32(colors[5]) << 16)
+	ptr++
+	// Word 4: pixels 7-8
+	buf[ptr] = uint32(colors[6]) | (uint32(colors[7]) << 16)
+	ptr++
+
+	// Remaining 79 bytes provide pixels 9-640 (632 pixels = 316 words)
+	for i := 1; i < frameWidth/8; i++ {
+		b = row[i]
+		colors = paletteBuf[int(b)*8:]
+		buf[ptr] = uint32(colors[0]) | (uint32(colors[1]) << 16)
+		ptr++
+		buf[ptr] = uint32(colors[2]) | (uint32(colors[3]) << 16)
+		ptr++
+		buf[ptr] = uint32(colors[4]) | (uint32(colors[5]) << 16)
+		ptr++
+		buf[ptr] = uint32(colors[6]) | (uint32(colors[7]) << 16)
+		ptr++
+	}
+
+	// End of line: after raw_1p fall-through outputs pixel 640,
+	// out pc reads this word's low 16 bits as the EOL command
+	buf[ptr] = uint32(COMPOSABLE_EOL_SKIP_ALIGN) // cmd in low 16, high 16 ignored
 }
 
 // Graphics primitives
@@ -569,27 +744,25 @@ func setPixel(x, y int, pen byte) {
 		return
 	}
 	byteIdx := x / 8
-	mask := byte(1 << (7 - (x % 8)))
+	bit := byte(1 << (7 - (x % 8)))
 	if pen != 0 {
-		frameBuffer[y][byteIdx] |= mask
+		frameBuffer[y][byteIdx] |= bit
 	} else {
-		frameBuffer[y][byteIdx] &^= mask
+		frameBuffer[y][byteIdx] &^= bit
 	}
 }
 
 func drawLine(x0, y0, x1, y1 int, pen byte) {
 	dx := abs(x1 - x0)
 	dy := abs(y1 - y0)
-	sx := 1
+	sx, sy := 1, 1
 	if x0 >= x1 {
 		sx = -1
 	}
-	sy := 1
 	if y0 >= y1 {
 		sy = -1
 	}
 	err := dx - dy
-
 	for {
 		setPixel(x0, y0, pen)
 		if x0 == x1 && y0 == y1 {
@@ -607,7 +780,7 @@ func drawLine(x0, y0, x1, y1 int, pen byte) {
 	}
 }
 
-func drawBox(x0, y0, x1, y1 int, pen byte) {
+func drawRect(x0, y0, x1, y1 int, pen byte) {
 	drawLine(x0, y0, x1, y0, pen)
 	drawLine(x1, y0, x1, y1, pen)
 	drawLine(x1, y1, x0, y1, pen)
@@ -615,13 +788,13 @@ func drawBox(x0, y0, x1, y1 int, pen byte) {
 }
 
 func clearScreen(pen byte) {
-	var fillByte byte
+	var fill byte
 	if pen != 0 {
-		fillByte = 0xFF
+		fill = 0xFF
 	}
 	for y := 0; y < frameHeight; y++ {
 		for x := 0; x < frameWidth/8; x++ {
-			frameBuffer[y][x] = fillByte
+			frameBuffer[y][x] = fill
 		}
 	}
 }
@@ -633,104 +806,59 @@ func abs(x int) int {
 	return x
 }
 
-// Hello World drawing
-
-func drawHelloWorld() {
-	x := hello.x
-	y := hello.y
-	h := 20
-	w := 10
-	H := h / 2
-	W := w / 2
-	dx := w + 10
-
-	// Draw border boxes
-	for i := 1; i < 8; i++ {
-		drawBox(i-1, i-1, frameWidth-i, frameHeight-i, 1)
+func drawPattern() {
+	// Border
+	for i := 0; i < 5; i++ {
+		drawRect(i, i, frameWidth-1-i, frameHeight-1-i, 1)
 	}
 
-	// H
-	drawLine(x, y, x, y+h, 1)
-	drawLine(x+w, y, x+w, y+h, 1)
-	drawLine(x, y+H, x+w, y+H, 1)
-	x += dx
-
-	// E
-	drawLine(x, y, x, y+h, 1)
-	drawLine(x, y, x+w, y, 1)
-	drawLine(x, y+H, x+w, y+H, 1)
-	drawLine(x, y+h, x+w, y+h, 1)
-	x += dx
-
-	// L
-	drawLine(x, y, x, y+h, 1)
-	drawLine(x, y+h, x+w, y+h, 1)
-	x += dx
-
-	// L
-	drawLine(x, y, x, y+h, 1)
-	drawLine(x, y+h, x+w, y+h, 1)
-	x += dx
-
-	// O
-	drawLine(x, y, x, y+h, 1)
-	drawLine(x+w, y, x+w, y+h, 1)
-	drawLine(x, y, x+w, y, 1)
-	drawLine(x, y+h, x+w, y+h, 1)
-	x = hello.x
-	y += h + 10
-
-	// W
-	drawLine(x, y, x, y+h, 1)
-	drawLine(x+w, y, x+w, y+h, 1)
-	drawLine(x, y+h, x+W, y+H, 1)
-	drawLine(x+w, y+h, x+W, y+H, 1)
-	x += dx
-
-	// O
-	drawLine(x, y, x, y+h, 1)
-	drawLine(x+w, y, x+w, y+h, 1)
-	drawLine(x, y, x+w, y, 1)
-	drawLine(x, y+h, x+w, y+h, 1)
-	x += dx
-
-	// R
-	drawLine(x, y, x, y+h, 1)
-	drawLine(x+w, y, x+w, y+H, 1)
-	drawLine(x, y, x+w, y, 1)
-	drawLine(x, y+H, x+w, y+H, 1)
-	drawLine(x+W, y+H, x+w, y+h, 1)
-	x += dx
-
-	// L
-	drawLine(x, y, x, y+h, 1)
-	drawLine(x, y+h, x+w, y+h, 1)
-	x += dx
-
-	// D
-	drawLine(x+W/2, y, x+W/2, y+h, 1)
-	drawLine(x, y, x+w, y, 1)
-	drawLine(x+w, y, x+w, y+h, 1)
-	drawLine(x, y+h, x+w, y+h, 1)
-	x += dx
-
-	// !
-	drawLine(x, y, x, y+H+H/2, 1)
-	drawLine(x, y+h-2, x, y+h, 1)
+	// Text at animated position
+	drawText(anim.x, anim.y, "HELLO", 1)
+	drawText(anim.x, anim.y+16, "WORLD", 1)
 }
 
-func eraseHelloWorld() {
-	clearScreen(0)
-}
-
-func moveHelloWorld() {
-	hello.x += hello.dx
-	hello.y += hello.dy
-	if hello.x > frameWidth-150 || hello.x < 20 {
-		hello.dx = -hello.dx
+func drawText(x, y int, text string, pen byte) {
+	for _, c := range text {
+		drawChar(x, y, byte(c), pen)
+		x += 12
 	}
-	if hello.y > frameHeight-80 || hello.y < 20 {
-		hello.dy = -hello.dy
+}
+
+func drawChar(x, y int, c byte, pen byte) {
+	// Simple 8x8 bitmap characters
+	switch c {
+	case 'H':
+		drawLine(x, y, x, y+10, pen)
+		drawLine(x+8, y, x+8, y+10, pen)
+		drawLine(x, y+5, x+8, y+5, pen)
+	case 'E':
+		drawLine(x, y, x, y+10, pen)
+		drawLine(x, y, x+8, y, pen)
+		drawLine(x, y+5, x+6, y+5, pen)
+		drawLine(x, y+10, x+8, y+10, pen)
+	case 'L':
+		drawLine(x, y, x, y+10, pen)
+		drawLine(x, y+10, x+8, y+10, pen)
+	case 'O':
+		drawRect(x, y, x+8, y+10, pen)
+	case 'W':
+		drawLine(x, y, x+2, y+10, pen)
+		drawLine(x+2, y+10, x+4, y+5, pen)
+		drawLine(x+4, y+5, x+6, y+10, pen)
+		drawLine(x+6, y+10, x+8, y, pen)
+	case 'R':
+		drawLine(x, y, x, y+10, pen)
+		drawLine(x, y, x+8, y, pen)
+		drawLine(x+8, y, x+8, y+4, pen)
+		drawLine(x, y+4, x+8, y+4, pen)
+		drawLine(x+4, y+4, x+8, y+10, pen)
+	case 'D':
+		drawLine(x, y, x, y+10, pen)
+		drawLine(x, y, x+6, y, pen)
+		drawLine(x+6, y, x+8, y+2, pen)
+		drawLine(x+8, y+2, x+8, y+8, pen)
+		drawLine(x+8, y+8, x+6, y+10, pen)
+		drawLine(x, y+10, x+6, y+10, pen)
 	}
 }
 
