@@ -71,16 +71,8 @@ func (g *GVga) SetPalette(palette []Color, start, count int) {
 	g.BorderColors[BorderLeft] = g.Palette[0]
 	g.BorderColors[BorderRight] = g.Palette[0]
 
-	// Recompute palette lookup table
-	switch g.Bits {
-	case 1:
-		g.computePalette1BPP()
-	case 2:
-		g.computePalette2BPP()
-	case 4:
-		g.computePalette4BPP()
-	// 8bpp doesn't need pre-computation (direct palette indexing)
-	}
+	// Recompute palette lookup table (uses global paletteBuf for fast scanline rendering)
+	g.buildPaletteBuf()
 }
 
 // SetBorderColors sets the border colors for all four sides

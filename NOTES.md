@@ -867,7 +867,7 @@ The reason RED (0x001F) worked on BLACK is that bits 0-4 map correctly for red-o
 The reason WHITE appeared correct on BLACK is visual perception - even with reduced
 green/blue, it looked "white enough" against pure black.
 
-### Fix Applied
+### Fix Attempt #1: RGB555 without gap
 
 Updated `initPalette()` in hello_world.go to use RGB555:
 ```go
@@ -877,19 +877,42 @@ const (
 )
 ```
 
-### Key Learnings
+**Result: GREEN background, BLACK text** - Still not correct!
 
-1. **Always verify pin mapping against color format** - The GVGA library was designed for different hardware
-2. **Test with pure primary colors** - Would have caught the shifted green/blue earlier
-3. **The "gap bit" is not just documentation** - It actually shifts all upper bits!
+### Current Status: STILL INVESTIGATING
+
+The RGB555 fix didn't fully work. Latest test shows:
+- Background (should be WHITE 0x7FFF) → shows GREEN
+- Text (should be RED 0x001F) → shows BLACK
+
+This suggests the pin mapping or color channel order is still wrong.
+
+### Possible Issues to Investigate
+
+1. **Pin order might be BGR not RGB** - Try swapping R and B
+2. **Bits might be inverted** - Try inverting all color bits
+3. **Different resistor DAC arrangement** - Pimoroni might use different weighting
+4. **PIO output order** - Verify which bits go to which pins
+
+### Test Values to Try Next
+
+| Format | WHITE | RED | GREEN | BLUE |
+|--------|-------|-----|-------|------|
+| RGB555 (current) | 0x7FFF | 0x001F | 0x03E0 | 0x7C00 |
+| BGR555 | 0x7FFF | 0x7C00 | 0x03E0 | 0x001F |
+| Inverted RGB | 0x8000 | 0x7FE0 | 0x7C1F | 0x03FF |
+
+### Key Learnings So Far
+
+1. **GVGA format (with gap) is definitely wrong** - Cyan background proved that
+2. **Simple RGB555 also doesn't work** - Green background proves pin mapping differs
+3. **Need to find actual Pimoroni VGA schematic** to determine exact pin→color mapping
+
+### Files Changed
+
+- `hello_world.go` - Color format experiments
+- `NOTES.md` - This investigation log
 
 ### Note for GVga Port
 
-When porting the full GVga library, the Color() function needs modification:
-```go
-// OLD (GVga format with gap):
-// func Color(r, g, b uint8) uint16 { return uint16(b)<<11 | uint16(g)<<6 | uint16(r) }
-
-// NEW (Pimoroni RGB555 format):
-func Color(r, g, b uint8) uint16 { return uint16(r) | uint16(g)<<5 | uint16(b)<<10 }
-```
+Color format TBD - need to solve the pin mapping first!

@@ -63,31 +63,25 @@ const (
 )
 
 // Composable scanline commands - these are jump offsets into the PIO program
-// The actual values depend on where instructions are loaded
-const (
-	ComposableColorRun     = 5  // Color run: | cmd | color | count-3 |
-	ComposableRawRun       = 8  // Raw run: | cmd | color | n | <n+2 colors> |
-	ComposableRaw1P        = 12 // Single pixel: | cmd | color |
-	ComposableRaw2P        = 14 // Two pixels: | cmd | color | color |
-	ComposableEOLAlign     = 3  // End of line (aligned)
-	ComposableEOLSkipAlign = 0  // End of line skip (aligned)
-)
+// Must match the offsets from scanvideo.pio exactly
+// See pio.go for the authoritative values (COMPOSABLE_* constants)
 
-// Standard VGA timing definitions
+// Standard VGA timing definitions (matches C pico-extras vga_modes.c)
 var (
-	// VGA 640x480 @ 60Hz - standard timing
+	// VGA 640x480 @ 60Hz - standard timing (non-48MHz mode)
+	// From C: vga_timing_640x480_60_default
 	Timing640x480_60 = Timing{
-		ClockFreq:     25000000,
+		ClockFreq:     25000000, // 25 MHz pixel clock
 		HActive:       640,
 		VActive:       480,
 		HFrontPorch:   16,
-		HPulse:        96,
+		HPulse:        96,       // Standard: 96 pixels
 		HTotal:        800,
-		HSyncPolarity: 0, // Active low
-		VFrontPorch:   10,
+		HSyncPolarity: 0,        // Active low (standard VGA)
+		VFrontPorch:   10,       // Standard: 10 lines
 		VPulse:        2,
-		VTotal:        525,
-		VSyncPolarity: 0, // Active low
+		VTotal:        525,      // Standard: 525 lines
+		VSyncPolarity: 0,        // Active low (standard VGA)
 		EnableClock:   0,
 		ClockPolarity: 0,
 		EnableDEN:     0,
