@@ -372,6 +372,14 @@ func initVideo() bool {
 	scanlineSM.SetPindirsConsecutive(pinRGBBase, 16, true)
 	scanlineSM.Init(scanlineOffset+1, scanlineCfg) // Start at entry point (wait IRQ)
 
+	// Enable OUT_STICKY - keeps OUT pins at their last value between OUT instructions
+	// This is critical for video output - without it, pins go to 0 between pixel outputs
+	// EXECCTRL.OUT_STICKY is bit 17
+	execctrl := rp.PIO0.SM0_EXECCTRL.Get()
+	execctrl |= (1 << 17) // Set OUT_STICKY bit
+	rp.PIO0.SM0_EXECCTRL.Set(execctrl)
+	println("SM0 EXECCTRL OUT_STICKY enabled:", hex(rp.PIO0.SM0_EXECCTRL.Get()))
+
 	// Debug: verify SM0 PINCTRL - check OUT_COUNT and OUT_BASE
 	pinctrl := rp.PIO0.SM0_PINCTRL.Get()
 	outBase := pinctrl & 0x1F
@@ -411,9 +419,9 @@ func initVideo() bool {
 	timingSM.Init(timingOffset, timingCfg)
 
 	// Debug: verify wrap was set correctly
-	execctrl := rp.PIO0.SM3_EXECCTRL.Get()
-	actualTop := (execctrl >> 12) & 0x1F
-	actualBottom := (execctrl >> 7) & 0x1F
+	sm3Execctrl := rp.PIO0.SM3_EXECCTRL.Get()
+	actualTop := (sm3Execctrl >> 12) & 0x1F
+	actualBottom := (sm3Execctrl >> 7) & 0x1F
 	println("After Init - SM3 EXECCTRL wrap: bottom=", actualBottom, "top=", actualTop)
 
 	// Debug: verify clock divider
@@ -707,20 +715,22 @@ func startDMA(buf unsafe.Pointer, count int) {
 // Palette and scanline building
 
 func initPalette() {
-	// Pimoroni VGA board expects contiguous RGB555 without gap:
-	//   Pins 0-4: Red (5 bits)
-	//   Pins 5-9: Green (5 bits)
-	//   Pins 10-14: Blue (5 bits)
-	// Color format: (R << 0) | (G << 5) | (B << 10)
-	// Note: GVGA uses (R<<0)|(G<<6)|(B<<11) with gap at bit 5 - DON'T USE THAT!
+	// GVGA/pico-extras scanvideo color format:
+	//   GPIO 0-4: Red (5 bits)
+	//   GPIO 5: Unused (gap in color word)
+	//   GPIO 6-10: Green (5 bits)
+	//   GPIO 11-15: Blue (5 bits)
+	// Color format: (R << 0) | (G << 6) | (B << 11)
+	// This matches GVGA_COLOR(r,g,b) macro and pico-extras PIXEL_RSHIFT/GSHIFT/BSHIFT
 	const (
-		RGB555_WHITE = (31 << 0) | (31 << 5) | (31 << 10) // 0x7FFF
-		RGB555_RED   = (31 << 0) | (0 << 5) | (0 << 10)   // 0x001F
+		GVGA_WHITE = (31 << 0) | (31 << 6) | (31 << 11) // 0xFFDF
+		GVGA_RED   = (31 << 0) | (0 << 6) | (0 << 11)   // 0x001F
 	)
 	colors := [2]uint16{
-		RGB555_WHITE, // Background - full white
-		RGB555_RED,   // Lines - full red
+		GVGA_WHITE, // Background - full white
+		GVGA_RED,   // Lines - full red
 	}
+	println("Palette colors: WHITE=", hex(uint32(GVGA_WHITE)), "RED=", hex(uint32(GVGA_RED)))
 	for i := 0; i < 256; i++ {
 		for j := 0; j < 8; j++ {
 			bit := 1 << (7 - j)
@@ -731,7 +741,7 @@ func initPalette() {
 			paletteBuf[i*8+j] = colors[idx]
 		}
 	}
-	println("Palette initialized (WHITE bg, RED fg - RGB555 format)")
+	println("Palette initialized (WHITE bg, RED fg - GVGA format)")
 }
 
 func initBlankScanline() {
