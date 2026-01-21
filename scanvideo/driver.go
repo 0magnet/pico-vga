@@ -211,46 +211,74 @@ func setupDMA() {
 }
 
 // initTimingState sets up the timing state machine parameters
+// This matches the C pico-extras scanvideo implementation exactly
 func initTimingState() {
 	timingState.vTotal = int32(timing.VTotal)
 	timingState.vActive = int32(timing.VActive)
 	timingState.vPulseStart = int32(timing.VActive + timing.VFrontPorch)
 	timingState.vPulseEnd = timingState.vPulseStart + int32(timing.VPulse)
 
-	// VSYNC polarity - bit 30 controls vsync pin
-	vsyncBit := uint32(0x40000000)
+	// VSYNC polarity - bit 30 controls vsync pin (bit 1 of 3-bit pin output)
+	// The vsync bit is bit 30 in the 32-bit word (shifted to position 1 of pins)
+	// Matches C code EXACTLY:
+	//   vsync_bits_pulse = timing->v_sync_polarity ? 0 : vsync_bit;
+	//   vsync_bits_no_pulse = timing->v_sync_polarity ? vsync_bit : 0;
+	vsyncBit := uint32(0x40000000) // Bit 30
 	if timing.VSyncPolarity != 0 {
+		// Active high: during pulse output 0, outside pulse output vsyncBit
 		timingState.vsyncPulse = 0
 		timingState.vsyncNoPulse = vsyncBit
 	} else {
+		// Active low: during pulse output vsyncBit, outside pulse output 0
 		timingState.vsyncPulse = vsyncBit
 		timingState.vsyncNoPulse = 0
 	}
 
 	// Calculate timing state values
-	// Each timing word contains: instruction | (cycles-3) << 16 | pins << 29
-	hSyncBit := uint32(0)
+	// Each timing word contains: instruction(16) | (cycles-3)(13) | pins(3)
+	// Pin bits: bit 29 = hsync, bit 30 = vsync, bit 31 = DEN (display enable)
+
+	// HSYNC polarity: 0 = active low, 1 = active high
+	// During HSYNC pulse, we want the active state
+	var hSyncPulse uint32    // Pin state during HSYNC pulse
+	var hSyncNoPulse uint32  // Pin state outside HSYNC pulse
 	if timing.HSyncPolarity == 0 {
-		hSyncBit = 1
+		// Active low: pulse = 0, no pulse = 1
+		hSyncPulse = 0
+		hSyncNoPulse = 1
+	} else {
+		// Active high: pulse = 1, no pulse = 0
+		hSyncPulse = 1
+		hSyncNoPulse = 0
 	}
 
-	// State A: Start of line (sets IRQ 0 for active, IRQ 1 for vblank)
-	// Short 4-cycle segment
-	timingState.a = encodeTimingState(SetIRQ0, 4, hSyncBit)
-	timingState.aVblank = encodeTimingState(SetIRQ1, 4, hSyncBit)
+	// DEN (Display Enable) bit - bit 31 (pin position 2)
+	denBit := uint32(4) // 0b100 - bit 2 of the 3-bit pin output
 
-	// State B1: Main back porch (clears scanline IRQ)
-	backPorch := int(timing.HTotal - timing.HActive - timing.HFrontPorch - timing.HPulse)
-	timingState.b1 = encodeTimingState(ClearIRQScanline, uint16(backPorch/2), hSyncBit)
-	timingState.b2 = encodeTimingState(ClearIRQScanline, uint16(backPorch-backPorch/2), hSyncBit)
+	// Calculate horizontal timing components
+	hBackPorch := int(timing.HTotal - timing.HActive - timing.HFrontPorch - timing.HPulse)
+	hActiveAndFront := int(timing.HActive + timing.HFrontPorch)
 
-	// State C: Active display + front porch (sets scanline IRQ at end)
-	// The scanline IRQ tells the scanline SM to start outputting
-	activeAndFront := int(timing.HActive + timing.HFrontPorch)
-	timingState.c = encodeTimingState(SetIRQScanline, uint16(activeAndFront), hSyncBit)
-	timingState.cVblank = encodeTimingState(ClearIRQScanline, uint16(activeAndFront), hSyncBit)
+	// State A: Start of line during HSYNC pulse (4 cycles)
+	// Sets IRQ 0 (active scanline) or IRQ 1 (vblank)
+	timingState.a = encodeTimingState(SetIRQ0, 4, hSyncPulse)
+	timingState.aVblank = encodeTimingState(SetIRQ1, 4, hSyncPulse)
 
-	// Start with vblank states
+	// State B1: Rest of HSYNC pulse (h_pulse - 4 cycles)
+	// Clears scanline IRQ (IRQ 4) - prepares for next scanline
+	timingState.b1 = encodeTimingState(ClearIRQScanline, uint16(timing.HPulse-4), hSyncPulse)
+
+	// State B2: Back porch (after HSYNC pulse)
+	// Continue clearing scanline IRQ, HSYNC now inactive
+	timingState.b2 = encodeTimingState(ClearIRQScanline, uint16(hBackPorch), hSyncNoPulse)
+
+	// State C: Active display + front porch
+	// Sets scanline IRQ (IRQ 4) to trigger pixel output
+	// For active lines: enable DEN bit; for vblank: no DEN
+	timingState.c = encodeTimingState(SetIRQScanline, uint16(hActiveAndFront), denBit|hSyncNoPulse)
+	timingState.cVblank = encodeTimingState(ClearIRQScanline, uint16(hActiveAndFront), hSyncNoPulse)
+
+	// Start with vblank states (frame starts in vblank)
 	setupDMAStatesVblank()
 	timingState.vsyncBits = timingState.vsyncNoPulse
 }
@@ -276,44 +304,77 @@ func setupDMAStatesActive() {
 }
 
 // TimingEnable starts or stops video timing
+// This follows the same sequence as the C pico-extras implementation
 func TimingEnable(enable bool) {
 	if enable == timingEnabled {
 		return
 	}
-	timingEnabled = enable
+
+	// Install IRQ handlers if not done yet
+	if !irqInstalled {
+		// PIO0 IRQ 0: handles active/vblank scanline IRQs from timing program
+		interrupt.New(rp.IRQ_PIO0_IRQ_0, pioIRQHandler).Enable()
+		// PIO0 IRQ 1: handles timing FIFO refill (TX not full)
+		interrupt.New(rp.IRQ_PIO0_IRQ_1, pioFIFOHandler).Enable()
+		irqInstalled = true
+	}
+
+	// Enable PIO IRQ sources
+	// For IRQ0: enable interrupt0 and interrupt1 (from timing program's IRQ instructions)
+	rp.PIO0.IRQ0_INTE.SetBits(0x03)
+	// For IRQ1: enable timing SM TX FIFO not full
+	rp.PIO0.IRQ1_INTE.SetBits(1 << (8 + TimingSM))
+
+	// Get state machine references
+	timingSM := videoPIO.StateMachine(TimingSM)
+	scanlineSM := videoPIO.StateMachine(ScanlineSM)
+
+	// Disable both SMs first
+	timingSM.SetEnabled(false)
+	scanlineSM.SetEnabled(false)
 
 	if enable {
-		// Install IRQ handler if not done yet
-		if !irqInstalled {
-			interrupt.New(rp.IRQ_PIO0_IRQ_0, pioIRQHandler).Enable()
-			irqInstalled = true
-		}
+		// Reset timing state
+		timingState.timingScanline = 0
+		timingState.stateIndex = 0
+		timingState.inVblank = true
+		setupDMAStatesVblank()
+		timingState.vsyncBits = timingState.vsyncNoPulse
 
-		// Enable PIO IRQs via direct hardware access
-		// IRQ0 enable bits: bits 0-7 are SM IRQs, bits 8-11 are FIFO IRQs
-		rp.PIO0.IRQ0_INTE.SetBits(0x03) // Enable IRQ 0 and 1 (active scanline and vblank)
+		// Clear any pending IRQ flags
+		videoPIO.ClearIRQ(0x0F)
 
-		// Enable timing SM FIFO not full IRQ on IRQ1
-		rp.PIO0.IRQ1_INTE.SetBits(1 << (TimingSM + 4)) // TX not full for SM3
-
-		// Prime the timing FIFO
+		// Prime the timing FIFO with initial data
 		topUpTimingFIFO()
 
-		// Start state machines
-		videoPIO.StateMachine(TimingSM).SetEnabled(true)
-		videoPIO.StateMachine(ScanlineSM).SetEnabled(true)
-	} else {
-		// Disable state machines
-		videoPIO.StateMachine(TimingSM).SetEnabled(false)
-		videoPIO.StateMachine(ScanlineSM).SetEnabled(false)
+		// Force scanline SM to jump to entry point (wait IRQ instruction)
+		// This ensures it starts waiting for the timing IRQ
+		scanlineSM.Exec(encodeJmp(scanlineOffset + OffsetEntryPoint))
 
+		// Force timing SM to jump to entry point
+		timingSM.Exec(encodeJmp(timingOffset))
+
+		// Enable both state machines
+		timingSM.SetEnabled(true)
+		scanlineSM.SetEnabled(true)
+	}
+
+	timingEnabled = enable
+
+	if !enable {
 		// Disable IRQs
 		rp.PIO0.IRQ0_INTE.ClearBits(0x03)
-		rp.PIO0.IRQ1_INTE.ClearBits(1 << (TimingSM + 4))
+		rp.PIO0.IRQ1_INTE.ClearBits(1 << (8 + TimingSM))
 	}
 }
 
-// pioIRQHandler handles PIO IRQs for timing and scanline
+// encodeJmp creates a PIO JMP instruction to the given address
+func encodeJmp(addr uint8) uint16 {
+	// PIO JMP instruction: 000 00 000 AAAAA (where AAAAA is the address)
+	return uint16(addr) & 0x1F
+}
+
+// pioIRQHandler handles PIO IRQs for active/vblank scanline start
 //go:nosplit
 func pioIRQHandler(intr interrupt.Interrupt) {
 	irqFlags := videoPIO.GetIRQ()
@@ -331,8 +392,11 @@ func pioIRQHandler(intr interrupt.Interrupt) {
 		videoPIO.ClearIRQ(3) // Clear both for good measure
 		prepareForVblankScanline()
 	}
+}
 
-	// Top up timing FIFO
+// pioFIFOHandler handles timing FIFO refill IRQ
+//go:nosplit
+func pioFIFOHandler(intr interrupt.Interrupt) {
 	topUpTimingFIFO()
 }
 

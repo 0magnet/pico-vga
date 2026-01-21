@@ -2,7 +2,11 @@
 // Ported from GVga C library by drfrancintosh
 package gvga
 
-import "machine"
+import (
+	"machine"
+
+	"github.com/0magnet/pico-vga/scanvideo"
+)
 
 // Color is RGB565 format (5 bits red, 6 bits green, 5 bits blue)
 type Color uint16
@@ -135,9 +139,10 @@ type GVga struct {
 	UserData interface{}
 
 	// Internal state
-	running   bool
-	lineCount uint16
+	running    bool
+	lineCount  uint16
 	frameCount uint32
+	vgaMode    *scanvideo.Mode
 }
 
 // ScanlineRenderFunc is the function signature for scanline renderers

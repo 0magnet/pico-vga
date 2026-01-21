@@ -46,8 +46,8 @@ func BuildTimingProgram() []uint16 {
 		// loop (offset 4):
 		//   nop
 		//   jmp x-- loop
-		asm.Nop().Encode(),                         // 4
-		asm.Jmp(pio.JmpXNZeroDec, 4).Encode(),      // 5: Delay loop
+		asm.Nop().Encode(),                    // 4
+		asm.Jmp(pio.JmpXNZeroDec, 4).Encode(), // 5: Delay loop
 
 		//   jmp entry_point
 		asm.Jmp(pio.JmpAlways, 0).Encode(), // 6: Get next timing word
@@ -74,89 +74,89 @@ const (
 )
 
 // BuildScanlineProgram creates the composable scanline PIO program
-// This program outputs pixels using a "composable" format where the data stream
-// contains jump offsets that direct the PIO to different code paths
+// This is an EXACT port of scanvideo.pio from pico-extras
 //
-// The composable format allows:
-// - COLOR_RUN: Output a single color for N pixels (efficient for solid areas)
-// - RAW_RUN: Output N arbitrary pixels
-// - RAW_1P, RAW_2P: Output 1 or 2 pixels
-// - EOL_ALIGN: End of line marker
+// The program MUST be loaded at offset 0 because the data contains
+// absolute addresses (jump targets) that are hardcoded
 //
-// Format: Data contains PIO addresses that cause jumps to specific handlers
+// For xscale=1 (default), this matches video_24mhz_composable_default exactly:
+//   0x6060, 0x20c4, 0x60b0, 0x6010, 0x6030, 0x0045, 0x60b0,
+//   0x6010, 0x6030, 0x6010, 0x0049, 0x6010, 0x60b0, 0x6010,
+//   0x6000, 0x60b0
+//
+// For xscale>1, delays are added to stretch pixels horizontally
 func BuildScanlineProgram(xscale uint8) []uint16 {
 	asm := pio.AssemblerV0{}
 
 	// Calculate delay based on xscale
-	// For xscale=1: no extra delay (extra0=0, extra1=1)
-	// For xscale=2: 1 extra cycle (extra0=1, extra1=2)
-	extra0 := xscale - 1
-	if xscale < 1 {
-		extra0 = 0
+	// For xscale=1: no extra delay (extra0=0, extra1=0)
+	// For xscale=2: 1 extra cycle (extra0=1, extra1=1)
+	// For xscale=N: N-1 extra cycles
+	var extra0, extra1 uint8
+	if xscale > 1 {
+		extra0 = xscale - 1
+		extra1 = xscale - 1
 	}
-	extra1 := extra0 + 1
 
-	// The program MUST be loaded at offset 0 because the data contains
-	// absolute addresses (jump targets)
 	program := []uint16{
 		// 0: end_of_scanline_skip_ALIGN - discard remaining OSR
-		asm.Out(pio.OutDestNull, 32).Encode(),
+		asm.Out(pio.OutDestNull, 32).Encode(), // 0: 0x6060
 
-		// 1: nop (padding to align entry_point)
-		asm.Nop().Encode(),
+		// 1: end_of_scanline_ALIGN / entry_point - wait for timing IRQ
+		asm.WaitIRQ(true, false, 4).Encode(), // 1: 0x20c4
 
-		// 2: nop (padding to align entry_point)
-		asm.Nop().Encode(),
+		// 2: nop_raw - main dispatch, jump based on data
+		asm.Out(pio.OutDestPC, 16).Encode(), // 2: 0x60b0
 
-		// entry_point (offset 3): Wait for timing IRQ, then start processing
-		asm.WaitIRQ(true, false, 4).Encode(), // 3: Wait for IRQ 4 from timing SM
+		// 3-6: color_run - output single color for count pixels
+		asm.Out(pio.OutDestPins, 16).Encode(),               // 3: 0x6010 - output color
+		asm.Out(pio.OutDestX, 16).Encode(),                  // 4: 0x6030 - load count
+		asm.Jmp(pio.JmpXNZeroDec, 5).Delay(extra1).Encode(), // 5: color_loop
+		asm.Out(pio.OutDestPC, 16).Delay(extra1).Encode(),   // 6: next command
 
-		// nop_raw (offset 4): Main dispatch - jump based on data
-		asm.Out(pio.OutDestPC, 16).Encode(), // 4: Jump to address from data
+		// 7-10: raw_run - output multiple raw pixels
+		asm.Out(pio.OutDestPins, 16).Delay(extra0).Encode(), // 7: raw_run - first pixel
+		asm.Out(pio.OutDestX, 16).Encode(),                  // 8: 0x6030 - load count
+		asm.Out(pio.OutDestPins, 16).Delay(extra0).Encode(), // 9: pixel_loop - output pixel
+		asm.Jmp(pio.JmpXNZeroDec, 9).Encode(),               // 10: loop back to pixel_loop
 
-		// color_run (offset 5): Output single color for count pixels
-		// Format: | jmp color_run | color | count-3 |
-		asm.Out(pio.OutDestPins, 16).Encode(),             // 5: Output color
-		asm.Out(pio.OutDestX, 16).Encode(),                // 6: Load count
-		// color_loop (offset 7):
-		asm.Jmp(pio.JmpXNZeroDec, 7).Delay(extra1).Encode(), // 7: Loop with delay
-		asm.Out(pio.OutDestPC, 16).Delay(extra1).Encode(),   // 8: Next command
+		// 11-12: raw_1p - output single pixel (wrap target)
+		asm.Out(pio.OutDestPins, 16).Delay(extra0).Encode(), // 11: raw_1p - output pixel
+		asm.Out(pio.OutDestPC, 16).Encode(),                 // 12: 0x60b0 - next command
 
-		// raw_run (offset 9): Output multiple pixels
-		// Format: | jmp raw_run | color | n | <n+2 colors> |
-		asm.Out(pio.OutDestPins, 16).Delay(extra0).Encode(), // 9: First pixel
-		asm.Out(pio.OutDestX, 16).Encode(),                  // 10: Load count
-		// pixel_loop (offset 11):
-		asm.Out(pio.OutDestPins, 16).Delay(extra0).Encode(), // 11: Output pixel
-		asm.Jmp(pio.JmpXNZeroDec, 11).Encode(),              // 12: Loop
+		// 13: raw_2p - output two pixels (wraps to raw_1p for second)
+		asm.Out(pio.OutDestPins, 16).Delay(extra1).Encode(), // 13: raw_2p - first pixel (wraps)
 
-		// raw_1p (offset 13): Output single pixel
-		// Format: | jmp raw_1p | color |
-		asm.Out(pio.OutDestPins, 16).Delay(extra0).Encode(), // 13: Output pixel
-		asm.Out(pio.OutDestPC, 16).Encode(),                 // 14: Next command
-
-		// raw_2p (offset 15): Output two pixels
-		// Format: | jmp raw_2p | color | color |
-		asm.Out(pio.OutDestPins, 16).Delay(extra1).Encode(), // 15: First pixel (wraps)
-	}
-
-	// Pad to ensure offsets are correct
-	for len(program) < 16 {
-		program = append(program, asm.Nop().Encode())
+		// 14-15: raw_1p_skip_ALIGN and nop_extra0
+		asm.Out(pio.OutDestPins, 32).Encode(),               // 14: 0x6000 - raw_1p_skip_ALIGN (32-bit!)
+		asm.Out(pio.OutDestPC, 16).Delay(extra0).Encode(),   // 15: nop_extra0
 	}
 
 	return program
 }
 
-// Composable command offsets (must match BuildScanlineProgram)
+// Composable command offsets - MUST match scanvideo.pio exactly
 const (
-	OffsetEOLSkipAlign = 0
-	OffsetEOLAlign     = 3
-	OffsetEntryPoint   = 3
-	OffsetColorRun     = 5
-	OffsetRawRun       = 9
-	OffsetRaw1P        = 13
-	OffsetRaw2P        = 15
+	OffsetEOLSkipAlign   = 0
+	OffsetEOLAlign       = 1
+	OffsetEntryPoint     = 1
+	OffsetColorRun       = 3
+	OffsetRawRun         = 7
+	OffsetRaw1P          = 11
+	OffsetRaw2P          = 13
+	OffsetRaw1PSkipAlign = 14
+)
+
+// COMPOSABLE_* constants for building scanline buffers
+// These are the PIO instruction offsets used in composable scanline data
+const (
+	COMPOSABLE_COLOR_RUN       = OffsetColorRun
+	COMPOSABLE_EOL_ALIGN       = OffsetEOLAlign
+	COMPOSABLE_EOL_SKIP_ALIGN  = OffsetEOLSkipAlign
+	COMPOSABLE_RAW_RUN         = OffsetRawRun
+	COMPOSABLE_RAW_1P          = OffsetRaw1P
+	COMPOSABLE_RAW_2P          = OffsetRaw2P
+	COMPOSABLE_RAW_1P_SKIP_ALIGN = OffsetRaw1PSkipAlign
 )
 
 // ConfigureTimingSM sets up the timing state machine
@@ -171,6 +171,7 @@ func ConfigureTimingSM(p *pio.PIO, sm pio.StateMachine, offset uint8) {
 
 	// Set clock divider for pixel clock
 	// 125MHz / 5 = 25MHz (for 640x480@60Hz which needs 25.175MHz)
+	// This gives 31.468 kHz HSYNC (800 pixels @ 25MHz = 32us/line = 31250 Hz)
 	cfg.SetClkDivIntFrac(5, 0)
 
 	// Configure pins
@@ -190,8 +191,8 @@ func ConfigureScanlineSM(p *pio.PIO, sm pio.StateMachine, offset uint8) {
 	// Configure OUT pins for RGB
 	cfg.SetOutPins(ColorPinBase, ColorPinCount)
 
-	// Shift right, no auto-pull (we control pulling)
-	cfg.SetOutShift(true, false, 32)
+	// Shift right, autopull at 32 bits
+	cfg.SetOutShift(true, true, 32)
 
 	// Join FIFOs for 8-deep TX
 	cfg.SetFIFOJoin(pio.FifoJoinTx)
@@ -206,5 +207,7 @@ func ConfigureScanlineSM(p *pio.PIO, sm pio.StateMachine, offset uint8) {
 	}
 	sm.SetPindirsConsecutive(ColorPinBase, ColorPinCount, true)
 
-	sm.Init(offset, cfg)
+	// Start at entry point (offset + 1), which is the wait IRQ instruction
+	// This is where the SM waits between scanlines
+	sm.Init(offset+OffsetEntryPoint, cfg)
 }
