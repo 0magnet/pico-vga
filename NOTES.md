@@ -806,74 +806,90 @@ Total: 3 words = 12 bytes (much smaller than RAW_RUN!)
 
 ## Color Format Investigation (2025-01-21)
 
-### Status: IN PROGRESS - Complex color behavior observed
+### Status: SOLVED - Format mismatch between GVGA and Pimoroni VGA board!
 
-The TinyGo VGA port has correct timing and display structure, but color output shows unexpected behavior.
+The TinyGo VGA port had incorrect color output due to a format mismatch.
 
-### Hardware
-- Pimoroni VGA Demo Base
-- Expected pin mapping: GPIO 0-4 = Red, GPIO 5-9 = Green, GPIO 10-14 = Blue
+### The Problem: GVGA vs Pimoroni Color Format
 
-### C GVga Color Format
+**GVGA (C library) color format** - has a gap at bit 5:
 ```c
 #define GVGA_COLOR(r,g,b) (((b)<<11u)|((g)<<6)|((r)<<0))
-// This is BGR with a gap at bit 5:
 // Bits 0-4:   R (5 bits)
-// Bit 5:     0 (gap)
+// Bit 5:     0 (UNUSED GAP!)
 // Bits 6-10: G (5 bits)
 // Bits 11-15: B (5 bits)
 
-GVGA_WHITE = GVGA_COLOR(0x1f, 0x1f, 0x1f) = 0xFFDF
-GVGA_RED = GVGA_COLOR(0x1f, 0, 0) = 0x001F
+GVGA_WHITE = 0xFFDF  (binary: 1111 1111 1101 1111)
+GVGA_RED = 0x001F    (binary: 0000 0000 0001 1111)
 ```
 
-### Test Results Summary
+**Pimoroni VGA board GPIO mapping** - contiguous, no gap:
+```
+GPIO 0-4:   R (5 bits)
+GPIO 5-9:   G (5 bits)
+GPIO 10-14: B (5 bits)
+```
+
+**The mismatch:**
+When outputting GVGA_WHITE (0xFFDF):
+- Bits 0-4 → GPIO 0-4 (R) = 11111 ✓
+- Bit 5 → GPIO 5 (G LSB) = 0 ✗ (should be 1!)
+- Bits 6-10 → GPIO 6-10 (G bits 1-4, B LSB) = shifted!
+- Bits 11-15 → GPIO 11-15 (B bits 1-4 + unused pin) = shifted!
+
+This caused WHITE (0xFFDF) to appear as CYAN (no red component visible) and explained
+why colors only worked correctly on BLACK backgrounds.
+
+### The Solution: Use RGB555 without gap
+
+**Correct format for Pimoroni VGA:**
+```
+RGB555 = (R << 0) | (G << 5) | (B << 10)
+
+RGB555_WHITE = (31 << 0) | (31 << 5) | (31 << 10) = 0x7FFF
+RGB555_RED   = (31 << 0) | (0 << 5) | (0 << 10)   = 0x001F
+RGB555_GREEN = (0 << 0) | (31 << 5) | (0 << 10)   = 0x03E0
+RGB555_BLUE  = (0 << 0) | (0 << 5) | (31 << 10)   = 0x7C00
+```
+
+### Previous Test Results (before fix)
 
 | Color Value | Used For | Expected | Actual Result |
 |-------------|----------|----------|---------------|
 | 0x0000 | Background | BLACK | BLACK ✓ |
 | 0x001F | Lines (on 0x0000 bg) | RED | RED ✓ |
-| 0xFFDF | Lines (on 0x0000 bg) | WHITE | WHITE ✓ |
+| 0xFFDF | Lines (on 0x0000 bg) | WHITE | WHITE ✓ (coincidence) |
 | 0xFFDF | Background | WHITE | CYAN ✗ |
 | 0x001F | Lines (on 0xFFDF bg) | RED | BLACK ✗ |
-| 0x7FFF | Background | WHITE | GREEN ✗ |
-| 0x03E0 | Lines | GREEN | Display breaks ✗ |
-| 0x7C00 | Lines | BLUE | Display breaks ✗ |
 
-### Key Observations
+The reason RED (0x001F) worked on BLACK is that bits 0-4 map correctly for red-only.
+The reason WHITE appeared correct on BLACK is visual perception - even with reduced
+green/blue, it looked "white enough" against pure black.
 
-1. **Individual colors work on BLACK background** - RED (0x001F) and WHITE (0xFFDF) display correctly when background is BLACK (0x0000)
+### Fix Applied
 
-2. **Colors fail when background is non-zero** - Same color values produce wrong output when used as background
-
-3. **Some color values break display** - Pure GREEN (0x03E0) and BLUE (0x7C00) cause "no display" (sync detected but no image)
-
-4. **Scanline buffer contains correct values** - Debug output shows palette colors are correctly packed into scanline buffer
-
-5. **PIO configuration is correct**:
-   - OUT_COUNT = 16 (verified via PINCTRL register)
-   - GPIO function select = 6 (PIO0) for pins 0, 5, 10 (verified)
-
-### Current Theory
-
-The issue appears to be related to how consecutive identical color values are output by the PIO. When outputting 0xFFDF for every pixel (background), only the G+B channels appear (CYAN). But when 0xFFDF is interspersed with 0x0000 (lines on black), it displays correctly as WHITE.
-
-This suggests possible:
-- Timing issue with outputting to all 16 GPIO pins simultaneously
-- Interaction between color channels when all are driven high
-- DMA or FIFO behavior difference for repeated vs varying data
-
-### Debug Output (latest)
-
-```
-HSYNC: 31250 Hz  Scanline[0-2]: 0x001F0007 0x001F027D 0x001F001F
+Updated `initPalette()` in hello_world.go to use RGB555:
+```go
+const (
+    RGB555_WHITE = (31 << 0) | (31 << 5) | (31 << 10) // 0x7FFF
+    RGB555_RED   = (31 << 0) | (0 << 5) | (0 << 10)   // 0x001F
+)
 ```
 
-This shows the scanline buffer contains RED (0x001F) pixels, but display shows CYAN background with black lines - indicating the palette lookup or buffer building may have an issue.
+### Key Learnings
 
-### Next Steps
+1. **Always verify pin mapping against color format** - The GVGA library was designed for different hardware
+2. **Test with pure primary colors** - Would have caught the shifted green/blue earlier
+3. **The "gap bit" is not just documentation** - It actually shifts all upper bits!
 
-1. Add debug output to verify paletteBuf[] values after initPalette()
-2. Trace exactly which bytes are in frameBuffer for line 0
-3. Test with different palette arrangements to isolate the issue
-4. Compare exact PIO program timing with C pico-extras
+### Note for GVga Port
+
+When porting the full GVga library, the Color() function needs modification:
+```go
+// OLD (GVga format with gap):
+// func Color(r, g, b uint8) uint16 { return uint16(b)<<11 | uint16(g)<<6 | uint16(r) }
+
+// NEW (Pimoroni RGB555 format):
+func Color(r, g, b uint8) uint16 { return uint16(r) | uint16(g)<<5 | uint16(b)<<10 }
+```

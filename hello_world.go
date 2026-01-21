@@ -297,8 +297,12 @@ func main() {
 				linesPerFrame = hsyncDelta / frameDelta
 			}
 
-			// Debug: print first few words of scanline buffer 0
-			println("HSYNC:", hsyncHz, "Hz  Scanline[0-2]:", hex(scanlineBufs[0][0]), hex(scanlineBufs[0][1]), hex(scanlineBufs[0][2]))
+			// Debug: Build a test scanline for line 100 and check the buffer
+			var testBuf [scanlineBufWords]uint32
+			buildScanline(100, &testBuf)
+			// Word 0 should have RAW_RUN (0x0007) in low 16 bits, first pixel color in high 16
+			// For background line, pixel should be 0xFFDF (WHITE)
+			println("HSYNC:", hsyncHz, "testBuf[0,1,2]:", hex(testBuf[0]), hex(testBuf[1]), hex(testBuf[2]))
 			_, _ = vsyncHz, linesPerFrame
 
 			lastHsync = h
@@ -703,12 +707,19 @@ func startDMA(buf unsafe.Pointer, count int) {
 // Palette and scanline building
 
 func initPalette() {
-	// GVGA format: (B<<11)|(G<<6)|(R<<0) with gap at bit 5
-	// GVGA_WHITE = 0xFFDF works for WHITE
-	// GVGA_RED = 0x001F works for RED
+	// Pimoroni VGA board expects contiguous RGB555 without gap:
+	//   Pins 0-4: Red (5 bits)
+	//   Pins 5-9: Green (5 bits)
+	//   Pins 10-14: Blue (5 bits)
+	// Color format: (R << 0) | (G << 5) | (B << 10)
+	// Note: GVGA uses (R<<0)|(G<<6)|(B<<11) with gap at bit 5 - DON'T USE THAT!
+	const (
+		RGB555_WHITE = (31 << 0) | (31 << 5) | (31 << 10) // 0x7FFF
+		RGB555_RED   = (31 << 0) | (0 << 5) | (0 << 10)   // 0x001F
+	)
 	colors := [2]uint16{
-		0xFFDF, // Background - GVGA WHITE
-		0x001F, // Lines - GVGA RED
+		RGB555_WHITE, // Background - full white
+		RGB555_RED,   // Lines - full red
 	}
 	for i := 0; i < 256; i++ {
 		for j := 0; j < 8; j++ {
@@ -720,7 +731,7 @@ func initPalette() {
 			paletteBuf[i*8+j] = colors[idx]
 		}
 	}
-	println("Palette initialized (WHITE bg, RED fg - BGR565 format)")
+	println("Palette initialized (WHITE bg, RED fg - RGB555 format)")
 }
 
 func initBlankScanline() {
