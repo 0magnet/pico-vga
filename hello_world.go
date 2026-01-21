@@ -83,12 +83,15 @@ var timingState struct {
 var dmaStates [4]uint32
 
 // Frame buffer (1bpp, 640x480 = 38400 bytes)
+// Double buffered to avoid tearing (like C gvga example)
 const (
 	frameWidth  = 640
 	frameHeight = 480
 )
 
-var frameBuffer [frameHeight][frameWidth / 8]byte
+var frameBuffers [2][frameHeight][frameWidth / 8]byte
+var drawBuffer int             // Buffer being drawn to (0 or 1)
+var showBuffer volatile.Register32 // Buffer being displayed (atomic for core sync)
 
 // Palette lookup table: byte value (0-255) -> 8 RGB565 colors
 var paletteBuf [256 * 8]uint16
@@ -131,7 +134,8 @@ type animation struct {
 	dx, dy int
 }
 
-var anim = animation{x: 100, y: 100, dx: 2, dy: 1}
+// Animation matches C example: start at (20,20), move by (5,5) per frame
+var anim = animation{x: 20, y: 20, dx: 5, dy: 5}
 
 func main() {
 	time.Sleep(5 * time.Second)
@@ -166,6 +170,7 @@ func main() {
 	var frameCount volatile.Register32
 	var hsyncCount volatile.Register32
 	var goroutineRunning volatile.Register32
+	var inVblank volatile.Register32 // Set to 1 during vblank, cleared when entering active
 
 	// Render loop runs on core1 via goroutine (TinyGo 0.38+ multicore support)
 	go func() {
@@ -185,6 +190,7 @@ func main() {
 				// IRQ 0: Active scanline
 				videoPIO.ClearIRQ(1)
 				hsyncCount.Set(hsyncCount.Get() + 1)
+				inVblank.Set(0) // Clear vblank flag when in active region
 
 				// Transfer scanline data via DMA from display buffer
 				if line >= 0 && line < frameHeight {
@@ -208,6 +214,7 @@ func main() {
 				// IRQ 1: Vblank scanline
 				videoPIO.ClearIRQ(2)
 				hsyncCount.Set(hsyncCount.Get() + 1)
+				inVblank.Set(1) // Set vblank flag - safe to update frame buffer
 
 				// During vblank, just send blank scanlines
 				startDMA(unsafe.Pointer(&blankScanline[0]), blankScanlineLen)
@@ -227,15 +234,14 @@ func main() {
 	println("Render loop running on core1")
 	println("Press 'r' to reboot to BOOTSEL")
 
-	// Main loop on core0: status display and animation (doesn't affect timing)
+	// Main loop on core0: animation runs every frame, status output every second
 	lastHsync := uint32(0)
 	lastFrame := uint32(0)
 	lastTime := time.Now()
+	lastStatusFrame := uint32(0)
 
 	for {
-		time.Sleep(time.Second)
-
-		// Check for reboot command
+		// Check for reboot command (non-blocking)
 		if machine.Serial.Buffered() > 0 {
 			b, _ := machine.Serial.ReadByte()
 			if b == 'r' || b == 'R' {
@@ -245,48 +251,61 @@ func main() {
 			}
 		}
 
-		// Calculate frequencies
-		now := time.Now()
-		elapsedMs := now.Sub(lastTime).Milliseconds()
-		if elapsedMs == 0 {
-			elapsedMs = 1
-		}
-
-		h := hsyncCount.Get()
-		f := frameCount.Get()
-
-		hsyncDelta := h - lastHsync
-		frameDelta := f - lastFrame
-
-		hsyncHz := (hsyncDelta * 1000) / uint32(elapsedMs)
-		vsyncHz := (frameDelta * 1000) / uint32(elapsedMs)
-		linesPerFrame := uint32(0)
-		if frameDelta > 0 {
-			linesPerFrame = hsyncDelta / frameDelta
-		}
-
-		println("HSYNC:", hsyncHz, "Hz  VSYNC:", vsyncHz, "Hz  Lines:", linesPerFrame)
-		println("  Target: HSYNC=31468 Hz, VSYNC=60 Hz, Lines=525")
-		println("  SM0 PC:", rp.PIO0.SM0_ADDR.Get(), "SM3 PC:", rp.PIO0.SM3_ADDR.Get())
-		println("  TxFull:", timingSM.IsTxFIFOFull(), "TxEmpty:", timingSM.IsTxFIFOEmpty())
-		println("  PIO IRQ:", videoPIO.GetIRQ())
-		println("  Goroutine iterations:", goroutineRunning.Get())
-
-		lastHsync = h
-		lastFrame = f
-		lastTime = now
-
-		// Update animation
+		// Draw to back buffer (not being displayed, so no tearing)
 		clearScreen(0)
 		anim.x += anim.dx
 		anim.y += anim.dy
-		if anim.x < 10 || anim.x > frameWidth-160 {
+		// Bounds check - match C example EXACTLY:
+		// if (state->x > state->width - 120 || state->x < 20)
+		// if (state->y > state->height - 70 || state->y < 20)
+		if anim.x > frameWidth-120 || anim.x < 20 {
 			anim.dx = -anim.dx
 		}
-		if anim.y < 10 || anim.y > frameHeight-80 {
+		if anim.y > frameHeight-70 || anim.y < 20 {
 			anim.dy = -anim.dy
 		}
 		drawPattern()
+
+		// Wait for vblank, then swap buffers
+		for inVblank.Get() == 0 {
+			// Busy wait for vblank
+		}
+		swapBuffers()
+
+		// Wait for vblank to end before next frame
+		for inVblank.Get() != 0 {
+			// Wait for active region to start
+		}
+
+		// Status output once per second (every ~60 frames)
+		f := frameCount.Get()
+		if f-lastStatusFrame >= 60 {
+			now := time.Now()
+			elapsedMs := now.Sub(lastTime).Milliseconds()
+			if elapsedMs == 0 {
+				elapsedMs = 1
+			}
+
+			h := hsyncCount.Get()
+			hsyncDelta := h - lastHsync
+			frameDelta := f - lastFrame
+
+			hsyncHz := (hsyncDelta * 1000) / uint32(elapsedMs)
+			vsyncHz := (frameDelta * 1000) / uint32(elapsedMs)
+			linesPerFrame := uint32(0)
+			if frameDelta > 0 {
+				linesPerFrame = hsyncDelta / frameDelta
+			}
+
+			// Debug: print first few words of scanline buffer 0
+			println("HSYNC:", hsyncHz, "Hz  Scanline[0-2]:", hex(scanlineBufs[0][0]), hex(scanlineBufs[0][1]), hex(scanlineBufs[0][2]))
+			_, _ = vsyncHz, linesPerFrame
+
+			lastHsync = h
+			lastFrame = f
+			lastTime = now
+			lastStatusFrame = f
+		}
 	}
 }
 
@@ -348,6 +367,24 @@ func initVideo() bool {
 	}
 	scanlineSM.SetPindirsConsecutive(pinRGBBase, 16, true)
 	scanlineSM.Init(scanlineOffset+1, scanlineCfg) // Start at entry point (wait IRQ)
+
+	// Debug: verify SM0 PINCTRL - check OUT_COUNT and OUT_BASE
+	pinctrl := rp.PIO0.SM0_PINCTRL.Get()
+	outBase := pinctrl & 0x1F
+	outCount := (pinctrl >> 20) & 0x3F
+	println("SM0 PINCTRL before fix: OUT_BASE=", outBase, "OUT_COUNT=", outCount)
+
+	// Force OUT_COUNT to 16 if it's wrong
+	if outCount != 16 {
+		println("Fixing OUT_COUNT to 16")
+		// OUT_BASE at bits 0-4, OUT_COUNT at bits 20-25
+		// Keep other fields, just fix OUT_COUNT
+		newPinctrl := (pinctrl & ^uint32(0x3F<<20)) | (16 << 20)
+		rp.PIO0.SM0_PINCTRL.Set(newPinctrl)
+		pinctrl = rp.PIO0.SM0_PINCTRL.Get()
+		outCount = (pinctrl >> 20) & 0x3F
+		println("SM0 PINCTRL after fix: OUT_COUNT=", outCount)
+	}
 
 	// Configure timing SM (SM3)
 	timingSM = videoPIO.StateMachine(3)
@@ -666,7 +703,13 @@ func startDMA(buf unsafe.Pointer, count int) {
 // Palette and scanline building
 
 func initPalette() {
-	colors := [2]uint16{0x0000, 0xFFFF} // Black, White
+	// GVGA format: (B<<11)|(G<<6)|(R<<0) with gap at bit 5
+	// GVGA_WHITE = 0xFFDF works for WHITE
+	// GVGA_RED = 0x001F works for RED
+	colors := [2]uint16{
+		0xFFDF, // Background - GVGA WHITE
+		0x001F, // Lines - GVGA RED
+	}
 	for i := 0; i < 256; i++ {
 		for j := 0; j < 8; j++ {
 			bit := 1 << (7 - j)
@@ -677,7 +720,7 @@ func initPalette() {
 			paletteBuf[i*8+j] = colors[idx]
 		}
 	}
-	println("Palette initialized")
+	println("Palette initialized (WHITE bg, RED fg - BGR565 format)")
 }
 
 func initBlankScanline() {
@@ -692,7 +735,8 @@ func initBlankScanline() {
 }
 
 func buildScanline(line int, buf *[scanlineBufWords]uint32) {
-	row := frameBuffer[line][:]
+	// Read from the show buffer (the one currently being displayed)
+	row := frameBuffers[showBuffer.Get()][line][:]
 	ptr := 0
 
 	// RAW_RUN format: | jmp raw_run | pixel1 | count | pixel2 | <count more pixels> |
@@ -746,9 +790,9 @@ func setPixel(x, y int, pen byte) {
 	byteIdx := x / 8
 	bit := byte(1 << (7 - (x % 8)))
 	if pen != 0 {
-		frameBuffer[y][byteIdx] |= bit
+		frameBuffers[drawBuffer][y][byteIdx] |= bit
 	} else {
-		frameBuffer[y][byteIdx] &^= bit
+		frameBuffers[drawBuffer][y][byteIdx] &^= bit
 	}
 }
 
@@ -794,9 +838,15 @@ func clearScreen(pen byte) {
 	}
 	for y := 0; y < frameHeight; y++ {
 		for x := 0; x < frameWidth/8; x++ {
-			frameBuffer[y][x] = fill
+			frameBuffers[drawBuffer][y][x] = fill
 		}
 	}
+}
+
+// swapBuffers swaps the draw and show buffers (call during vblank)
+func swapBuffers() {
+	showBuffer.Set(uint32(drawBuffer))
+	drawBuffer = 1 - drawBuffer
 }
 
 func abs(x int) int {
@@ -807,58 +857,79 @@ func abs(x int) int {
 }
 
 func drawPattern() {
-	// Border
-	for i := 0; i < 5; i++ {
-		drawRect(i, i, frameWidth-1-i, frameHeight-1-i, 1)
+	// Border - matches C example: 15 boxes with alternating colors
+	// In 1bpp mode, color alternates between 0 (background) and 1 (foreground)
+	for i := 1; i < 16; i++ {
+		color := byte(i % 2) // Alternates 1, 0, 1, 0, ...
+		drawRect(i-1, i-1, frameWidth-i, frameHeight-i, color)
 	}
 
-	// Text at animated position
+	// Text at animated position - matches C example exactly
+	// C uses: h=20, w=10, dx=w+10=20, dy=h+10=30
 	drawText(anim.x, anim.y, "HELLO", 1)
-	drawText(anim.x, anim.y+16, "WORLD", 1)
+	drawText(anim.x, anim.y+30, "WORLD!", 1) // dy=30 matches C example (h+10 = 20+10)
 }
 
 func drawText(x, y int, text string, pen byte) {
+	// C example: dx = w + 10 = 10 + 10 = 20
 	for _, c := range text {
 		drawChar(x, y, byte(c), pen)
-		x += 12
+		x += 20
 	}
 }
 
 func drawChar(x, y int, c byte, pen byte) {
-	// Simple 8x8 bitmap characters
+	// Match C example EXACTLY: w=10, h=20, H=h/2=10, W=w/2=5
+	const w = 10
+	const h = 20
+	const H = h / 2 // 10
+	const W = w / 2 // 5
+
 	switch c {
 	case 'H':
-		drawLine(x, y, x, y+10, pen)
-		drawLine(x+8, y, x+8, y+10, pen)
-		drawLine(x, y+5, x+8, y+5, pen)
+		// C: gfx_line(x+0, y+0, x+0, y+h), gfx_line(x+w, y+0, x+w, y+h), gfx_line(x+0, y+H, x+w, y+H)
+		drawLine(x, y, x, y+h, pen)
+		drawLine(x+w, y, x+w, y+h, pen)
+		drawLine(x, y+H, x+w, y+H, pen)
 	case 'E':
-		drawLine(x, y, x, y+10, pen)
-		drawLine(x, y, x+8, y, pen)
-		drawLine(x, y+5, x+6, y+5, pen)
-		drawLine(x, y+10, x+8, y+10, pen)
+		// C: vertical, top, middle, bottom
+		drawLine(x, y, x, y+h, pen)
+		drawLine(x, y, x+w, y, pen)
+		drawLine(x, y+H, x+w, y+H, pen)
+		drawLine(x, y+h, x+w, y+h, pen)
 	case 'L':
-		drawLine(x, y, x, y+10, pen)
-		drawLine(x, y+10, x+8, y+10, pen)
+		// C: vertical, bottom
+		drawLine(x, y, x, y+h, pen)
+		drawLine(x, y+h, x+w, y+h, pen)
 	case 'O':
-		drawRect(x, y, x+8, y+10, pen)
+		// C: left, right, top, bottom
+		drawLine(x, y, x, y+h, pen)
+		drawLine(x+w, y, x+w, y+h, pen)
+		drawLine(x, y, x+w, y, pen)
+		drawLine(x, y+h, x+w, y+h, pen)
 	case 'W':
-		drawLine(x, y, x+2, y+10, pen)
-		drawLine(x+2, y+10, x+4, y+5, pen)
-		drawLine(x+4, y+5, x+6, y+10, pen)
-		drawLine(x+6, y+10, x+8, y, pen)
+		// C: left, right, bottom-left diagonal, bottom-right diagonal
+		drawLine(x, y, x, y+h, pen)
+		drawLine(x+w, y, x+w, y+h, pen)
+		drawLine(x, y+h, x+W, y+H, pen)
+		drawLine(x+w, y+h, x+W, y+H, pen)
 	case 'R':
-		drawLine(x, y, x, y+10, pen)
-		drawLine(x, y, x+8, y, pen)
-		drawLine(x+8, y, x+8, y+4, pen)
-		drawLine(x, y+4, x+8, y+4, pen)
-		drawLine(x+4, y+4, x+8, y+10, pen)
+		// C: vertical, top right vertical, top, middle, diagonal leg
+		drawLine(x, y, x, y+h, pen)
+		drawLine(x+w, y, x+w, y+H, pen)
+		drawLine(x, y, x+w, y, pen)
+		drawLine(x, y+H, x+w, y+H, pen)
+		drawLine(x+W, y+H, x+w, y+h, pen)
 	case 'D':
-		drawLine(x, y, x, y+10, pen)
-		drawLine(x, y, x+6, y, pen)
-		drawLine(x+6, y, x+8, y+2, pen)
-		drawLine(x+8, y+2, x+8, y+8, pen)
-		drawLine(x+8, y+8, x+6, y+10, pen)
-		drawLine(x, y+10, x+6, y+10, pen)
+		// C: left vertical (at W/2), top, right, bottom
+		drawLine(x+W/2, y, x+W/2, y+h, pen)
+		drawLine(x, y, x+w, y, pen)
+		drawLine(x+w, y, x+w, y+h, pen)
+		drawLine(x, y+h, x+w, y+h, pen)
+	case '!':
+		// C: vertical line, dot at bottom
+		drawLine(x, y, x, y+H+H/2, pen)
+		drawLine(x, y+h-2, x, y+h, pen)
 	}
 }
 

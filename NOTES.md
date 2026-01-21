@@ -801,3 +801,79 @@ Total: 3 words = 12 bytes (much smaller than RAW_RUN!)
 2. Composable scanline format works correctly
 3. Multicore (goroutine on core1) provides stable timing
 4. The architecture matches C pico-extras scanvideo library
+
+---
+
+## Color Format Investigation (2025-01-21)
+
+### Status: IN PROGRESS - Complex color behavior observed
+
+The TinyGo VGA port has correct timing and display structure, but color output shows unexpected behavior.
+
+### Hardware
+- Pimoroni VGA Demo Base
+- Expected pin mapping: GPIO 0-4 = Red, GPIO 5-9 = Green, GPIO 10-14 = Blue
+
+### C GVga Color Format
+```c
+#define GVGA_COLOR(r,g,b) (((b)<<11u)|((g)<<6)|((r)<<0))
+// This is BGR with a gap at bit 5:
+// Bits 0-4:   R (5 bits)
+// Bit 5:     0 (gap)
+// Bits 6-10: G (5 bits)
+// Bits 11-15: B (5 bits)
+
+GVGA_WHITE = GVGA_COLOR(0x1f, 0x1f, 0x1f) = 0xFFDF
+GVGA_RED = GVGA_COLOR(0x1f, 0, 0) = 0x001F
+```
+
+### Test Results Summary
+
+| Color Value | Used For | Expected | Actual Result |
+|-------------|----------|----------|---------------|
+| 0x0000 | Background | BLACK | BLACK ✓ |
+| 0x001F | Lines (on 0x0000 bg) | RED | RED ✓ |
+| 0xFFDF | Lines (on 0x0000 bg) | WHITE | WHITE ✓ |
+| 0xFFDF | Background | WHITE | CYAN ✗ |
+| 0x001F | Lines (on 0xFFDF bg) | RED | BLACK ✗ |
+| 0x7FFF | Background | WHITE | GREEN ✗ |
+| 0x03E0 | Lines | GREEN | Display breaks ✗ |
+| 0x7C00 | Lines | BLUE | Display breaks ✗ |
+
+### Key Observations
+
+1. **Individual colors work on BLACK background** - RED (0x001F) and WHITE (0xFFDF) display correctly when background is BLACK (0x0000)
+
+2. **Colors fail when background is non-zero** - Same color values produce wrong output when used as background
+
+3. **Some color values break display** - Pure GREEN (0x03E0) and BLUE (0x7C00) cause "no display" (sync detected but no image)
+
+4. **Scanline buffer contains correct values** - Debug output shows palette colors are correctly packed into scanline buffer
+
+5. **PIO configuration is correct**:
+   - OUT_COUNT = 16 (verified via PINCTRL register)
+   - GPIO function select = 6 (PIO0) for pins 0, 5, 10 (verified)
+
+### Current Theory
+
+The issue appears to be related to how consecutive identical color values are output by the PIO. When outputting 0xFFDF for every pixel (background), only the G+B channels appear (CYAN). But when 0xFFDF is interspersed with 0x0000 (lines on black), it displays correctly as WHITE.
+
+This suggests possible:
+- Timing issue with outputting to all 16 GPIO pins simultaneously
+- Interaction between color channels when all are driven high
+- DMA or FIFO behavior difference for repeated vs varying data
+
+### Debug Output (latest)
+
+```
+HSYNC: 31250 Hz  Scanline[0-2]: 0x001F0007 0x001F027D 0x001F001F
+```
+
+This shows the scanline buffer contains RED (0x001F) pixels, but display shows CYAN background with black lines - indicating the palette lookup or buffer building may have an issue.
+
+### Next Steps
+
+1. Add debug output to verify paletteBuf[] values after initPalette()
+2. Trace exactly which bytes are in frameBuffer for line 0
+3. Test with different palette arrangements to isolate the issue
+4. Compare exact PIO program timing with C pico-extras
