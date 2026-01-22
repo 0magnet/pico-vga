@@ -193,43 +193,52 @@ func main() {
 	// Pre-build first scanline
 	buildScanline(0, &scanlineBufs[0])
 
-	// Enable video output
-	enableVideo(true)
-	println("Video enabled")
-
 	// Counters for frequency measurement (shared with goroutine via volatile)
 	var frameCount volatile.Register32
 	var hsyncCount volatile.Register32
 	var goroutineRunning volatile.Register32
+	var goroutineReady volatile.Register32 // Signal that goroutine is ready
 	var inVblank volatile.Register32 // Set to 1 during vblank, cleared when entering active
 	var activeDmaCount volatile.Register32  // DMA starts during active region
 	var vblankDmaCount volatile.Register32  // DMA starts during vblank
 	var fifoEmptyCount volatile.Register32  // Times FIFO was empty when we checked
 
 	// Using COLOR_RUN format like C scanvideo_minimal - only 3 words per scanline!
-	// This is the key difference from RAW_RUN (322 words) that caused DMA collisions
-	const GVGA_WHITE = 0xFFDF // Test with WHITE
-	const MIN_COLOR_RUN = 3   // Matches C definition
-	println("Using COLOR_RUN format: 3 words/scanline (like C scanvideo_minimal)")
+	const MIN_COLOR_RUN = 3
+	println("Using COLOR_RUN format with color cycling")
+
+	// Color definitions for Pimoroni VGA Demo Base (RGB555: R[4:0] | G[10:6] | B[15:11])
+	const (
+		COLOR_BLACK   = 0x0000
+		COLOR_RED     = 0x001F // R=31, G=0, B=0
+		COLOR_GREEN   = 0x07C0 // R=0, G=31, B=0
+		COLOR_BLUE    = 0xF800 // R=0, G=0, B=31
+		COLOR_YELLOW  = 0x07DF // R=31, G=31, B=0
+		COLOR_MAGENTA = 0xF81F // R=31, G=0, B=31
+		COLOR_CYAN    = 0xFFC0 // R=0, G=31, B=31
+		COLOR_WHITE   = 0xFFDF // R=31, G=31, B=31
+	)
+
+	// Color cycle array
+	colors := []uint16{COLOR_BLACK, COLOR_RED, COLOR_GREEN, COLOR_BLUE, COLOR_YELLOW, COLOR_MAGENTA, COLOR_CYAN, COLOR_WHITE}
+	colorNames := []string{"BLACK", "RED", "GREEN", "BLUE", "YELLOW", "MAGENTA", "CYAN", "WHITE"}
+
+	// Current color (shared with render goroutine)
+	var currentColor volatile.Register32
+	currentColor.Set(uint32(colors[0]))
+	var colorIndex int
 
 	// single_color_scanline - exact port of C function from scanvideo_minimal.c
-	// Returns number of words used (always 3)
 	single_color_scanline := func(buf []uint32, width int, color16 uint16) int {
-		// | jmp color_run | color | count-3 | COMPOSABLE_RAW_1P | black | EOL_ALIGN |
 		buf[0] = uint32(COMPOSABLE_COLOR_RUN) | (uint32(color16) << 16)
 		buf[1] = uint32(width-MIN_COLOR_RUN) | (uint32(COMPOSABLE_RAW_1P) << 16)
-		// Note: must end with a black pixel (per C comment)
 		buf[2] = 0 | (uint32(COMPOSABLE_EOL_ALIGN) << 16)
 		return 3
 	}
 
-	// Build COLOR_RUN scanline with line-based color (like C example)
-	// C uses: bgcolour = (uint16_t) l << 2
+	// Build COLOR_RUN scanline with current color
 	buildColorRunScanline := func(line int, buf []uint32) int {
-		// For solid color test, use constant WHITE
-		// To match C gradient: color16 := uint16(line << 2)
-		color16 := uint16(GVGA_WHITE)
-		return single_color_scanline(buf, frameWidth, color16)
+		return single_color_scanline(buf, frameWidth, uint16(currentColor.Get()))
 	}
 
 	// Pre-build first scanline using COLOR_RUN
@@ -244,9 +253,10 @@ func main() {
 	var gpioLine479 volatile.Register32 // GPIO at line 479 (bottom)
 	gpioIn := (*volatile.Register32)(unsafe.Pointer(uintptr(0xd0000004)))
 
-	// Render loop using COLOR_RUN format (3 words) - matches C scanvideo_minimal
+	// Start render loop BEFORE enabling video (crucial to avoid missing first IRQs)
 	go func() {
 		goroutineRunning.Set(1)
+		goroutineReady.Set(1) // Signal we're ready
 		line := 0
 		displayBuf := 0 // Start with scanlineBufs[0] which was pre-built
 		dataLen := colorRunLen // 3 words for COLOR_RUN
@@ -264,6 +274,7 @@ func main() {
 				videoPIO.ClearIRQ(1)
 				hsyncCount.Set(hsyncCount.Get() + 1)
 				inVblank.Set(0)
+				currentRegion.Set(0) // Track we're in active region
 
 				// Sample GPIO at strategic lines
 				switch line {
@@ -305,10 +316,17 @@ func main() {
 				videoPIO.ClearIRQ(2)
 				hsyncCount.Set(hsyncCount.Get() + 1)
 				inVblank.Set(1)
+				currentRegion.Set(1) // Track we're in vblank region
 
-				// During vblank, just send blank scanlines
-				startDMA(unsafe.Pointer(&blankScanline[0]), blankScanlineLen)
-				vblankDmaCount.Set(vblankDmaCount.Get() + 1)
+				// During vblank, send blank scanlines - but skip if DMA busy
+				// This prevents collisions since vblank doesn't need every scanline
+				dma := getDMAChannel(0)
+				if dma.CtrlTrig.Get()&(1<<24) == 0 {
+					// DMA idle - safe to start new transfer
+					startDMA(unsafe.Pointer(&blankScanline[0]), blankScanlineLen)
+					vblankDmaCount.Set(vblankDmaCount.Get() + 1)
+				}
+				// Note: If DMA busy, we skip this vblank line (no collision)
 				line++
 			}
 
@@ -322,7 +340,15 @@ func main() {
 		}
 	}()
 
-	println("Render loop running on core1")
+	// Wait for goroutine to be ready before enabling video
+	for goroutineReady.Get() == 0 {
+		// Busy wait
+	}
+	println("Render loop ready")
+
+	// NOW enable video - goroutine is ready to handle IRQs
+	enableVideo(true)
+	println("Video enabled")
 	println("Press 'r' to reboot to BOOTSEL")
 
 	// Main loop on core0: animation runs every frame, status output every second
@@ -342,12 +368,18 @@ func main() {
 			}
 		}
 
-		// DISABLED: Animation and buffer swapping for solid color test
-		// Just idle - no drawing, no buffer swaps
 		_ = inVblank // suppress unused warning
 
-		// Status output every 2 seconds (same as hello_world)
+		// Color cycling - change color every 60 frames (1 second at 60Hz)
 		f := frameCount.Get()
+		newColorIndex := int(f/60) % len(colors)
+		if newColorIndex != colorIndex {
+			colorIndex = newColorIndex
+			currentColor.Set(uint32(colors[colorIndex]))
+			println("Color:", colorNames[colorIndex], "value:", hex(uint32(colors[colorIndex])))
+		}
+
+		// Status output every 2 seconds
 		if f-lastStatusFrame >= 120 {
 			now := time.Now()
 			elapsedMs := now.Sub(lastTime).Milliseconds()
@@ -426,7 +458,7 @@ func main() {
 			dmaWrite := dma.WriteAddr.Get()
 			dmaCnt := dma.TransCount.Get()
 			println("DMA0: busy=", dmaBusy, "read=", hex(dmaRead), "write=", hex(dmaWrite), "cnt=", dmaCnt)
-			println("DMA waits:", dmaWaitCount.Get(), "collisions:", dmaCollisionCount.Get())
+			println("DMA collisions:", dmaCollisionCount.Get(), "active:", activeCollisions.Get(), "vblank:", vblankCollisions.Get())
 
 			// SM0 and SM3 config registers
 			sm0Pinctrl := rp.PIO0.SM0_PINCTRL.Get()
@@ -611,7 +643,8 @@ func initTimingState() {
 	timingState.c = timingEncode(SET_IRQ_SCANLINE, hActiveAndFront, 4|hSyncNoBit) // DEN bit
 	timingState.cVblank = timingEncode(CLEAR_IRQ_SCANLINE, hActiveAndFront, hSyncNoBit)
 
-	// Initialize state
+	// Initialize state - start with vblank states like the scanvideo library
+	// Frame starts in vblank, then transitions to active when timingScanline wraps
 	setupDmaStatesVblank()
 	timingState.vsyncBits = timingState.vsyncBitsNoPulse
 	timingState.dmaStateIndex = 0
@@ -778,13 +811,10 @@ func enableVideo(enable bool) {
 		}
 		println("  Timing FIFO primed, TxFull:", timingSM.IsTxFIFOFull())
 
-		// Pre-fill scanline FIFO with blank data (match hello_world approach)
-		// Single blank scanline to prime the FIFO
-		println("  Pre-filling scanline FIFO with blank data...")
-		const blankColor = 0 // BLACK - match hello_world
-		scanlineSM.TxPut(uint32(COMPOSABLE_COLOR_RUN) | (blankColor << 16))
-		scanlineSM.TxPut(uint32(frameWidth-3) | (uint32(COMPOSABLE_RAW_1P) << 16))
-		scanlineSM.TxPut(blankColor | (uint32(COMPOSABLE_EOL_ALIGN) << 16))
+		// No pre-fill needed - scanline SM starts at "wait irq 4" and won't
+		// consume data until timing SM fires IRQ 4. By then the render loop
+		// should have sent the first DMA transfer.
+		println("  Scanline SM will wait for IRQ 4 trigger...")
 		// Check FIFO level after pre-fill
 		flevel := rp.PIO0.FLEVEL.Get()
 		sm0TxLevel := (flevel >> 0) & 0xF
@@ -862,13 +892,22 @@ func waitDMA() {
 var dmaCollisionCount volatile.Register32
 var dmaWaitCount volatile.Register32
 
+var activeCollisions volatile.Register32
+var vblankCollisions volatile.Register32
+var currentRegion volatile.Register32 // 0 = active, 1 = vblank
+
 func startDMA(buf unsafe.Pointer, count int) {
 	dma := getDMAChannel(0)
 
-	// Check if previous DMA still running (collision detection only, no blocking)
-	// Blocking here breaks timing - we pace with delay in buildSolidScanline instead
+	// Check if previous DMA still running (collision detection)
 	if dma.CtrlTrig.Get()&(1<<24) != 0 {
 		dmaCollisionCount.Set(dmaCollisionCount.Get() + 1)
+		// Track where collision occurred
+		if currentRegion.Get() == 0 {
+			activeCollisions.Set(activeCollisions.Get() + 1)
+		} else {
+			vblankCollisions.Set(vblankCollisions.Get() + 1)
+		}
 	}
 
 	dma.ReadAddr.Set(uint32(uintptr(buf)))
