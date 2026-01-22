@@ -956,11 +956,22 @@ The difference: COLOR_RUN outputs color once and holds with sticky output during
 
 ### Workflow Notes
 
-Effective development workflow for Pico VGA:
+**One-liner build/flash/reboot:**
+```bash
+tinygo build -target=pico -o hello.uf2 hello_world.go 2>&1 && echo 'r' > /dev/ttyACM0 2>/dev/null; sleep 3; picotool load -f hello.uf2 && picotool reboot
+```
+
+**With serial monitor (chain with mcu mon):**
+```bash
+tinygo build -target=pico -o hello.uf2 hello_world.go 2>&1 && echo 'r' > /dev/ttyACM0 2>/dev/null; sleep 3; picotool load -f hello.uf2 && picotool reboot; sleep 3; mcu mon -m /dev/ttyACM0 -b 115200
+```
+
+**Individual steps:**
 1. Build: `tinygo build -target=pico -o hello.uf2 hello_world.go`
 2. Reboot to bootloader: `echo 'r' > /dev/ttyACM0`
-3. Flash: `picotool load hello.uf2 -x`
-4. Monitor: `mcu mon -m /dev/ttyACM0 -b 115200`
+3. Flash: `picotool load -f hello.uf2`
+4. Reboot: `picotool reboot`
+5. Monitor: `mcu mon -m /dev/ttyACM0 -b 115200`
 
 ### Prototype Saved
 

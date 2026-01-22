@@ -649,11 +649,6 @@ func buildScanlineProgram() []uint16 {
 
 	// PIO delay is encoded in bits 8-12 of the instruction
 	// To add delay N: instruction | (N << 8)
-	// For proper pixel timing at 31.25 MHz with RAW_RUN:
-	// Need ~4 cycles per pixel for 640 pixels in 25.6 µs
-	// 640 * 4 / 31.25 MHz = 81.9 µs - too slow!
-	// With divider 4 (31.25 MHz) and 2 cycles/pixel: 640 * 2 / 31.25 = 41 µs - still too slow
-	// Solution: Use divider 2.5 (50 MHz) with 2 cycles/pixel: 640 * 2 / 50 = 25.6 µs ✓
 	const delay1 = 1 << 8 // 1 cycle delay
 
 	return []uint16{
@@ -704,7 +699,6 @@ func enableVideo(enable bool) {
 
 		// Pre-fill scanline FIFO with blank (black) COLOR_RUN data
 		// The first few scanlines will be blank during sync-up
-		// This is simpler and avoids timing issues with line 0 data
 		println("  Pre-filling scanline FIFO with blank data...")
 		const blankColor = 0 // BLACK
 		scanlineSM.TxPut(uint32(COMPOSABLE_COLOR_RUN) | (blankColor << 16))
