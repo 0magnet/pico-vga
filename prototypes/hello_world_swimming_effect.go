@@ -417,9 +417,9 @@ func initVideo() bool {
 	scanlineCfg.SetOutPins(pinRGBBase, 16)
 	scanlineCfg.SetOutShift(true, true, 32) // Shift right, autopull
 	scanlineCfg.SetFIFOJoin(pio.FifoJoinTx) // 8-deep TX FIFO
-	// Clock divider 4 = 31.25 MHz, same as timing SM for synchronization
-	// Note: RED channel issue still unresolved - shows CYAN instead of WHITE
-	scanlineCfg.SetClkDivIntFrac(4, 0)
+	// RAW_RUN: 2 cycles per pixel at 50 MHz = 25 MHz pixel clock
+	// Clock divider 2.5 = 125 MHz / 2.5 = 50 MHz
+	scanlineCfg.SetClkDivIntFrac(2, 128)
 	// CRITICAL: Enable sticky output - continuously assert OUT pins (matches C scanvideo)
 	scanlineCfg.SetOutSpecial(true, false, 0)
 

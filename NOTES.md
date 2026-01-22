@@ -916,3 +916,58 @@ This suggests the pin mapping or color channel order is still wrong.
 ### Note for GVga Port
 
 Color format TBD - need to solve the pin mapping first!
+
+---
+
+## Session Notes (2026-01-21)
+
+### Key Discovery: FIFO Pre-fill Required
+
+**Problem:** Display showed "brief flashes of color" or "fading to black" with composable scanlines.
+
+**Root Cause:** The scanline SM starts at "wait irq 4" but the FIFO was empty. When IRQ 4 fired, there was no data ready, causing synchronization issues.
+
+**Solution:** Pre-fill the scanline FIFO before enabling video output:
+```go
+// In enableVideo():
+scanlineSM.TxPut(uint32(COMPOSABLE_COLOR_RUN) | (0 << 16))
+scanlineSM.TxPut(uint32(frameWidth-3) | (uint32(COMPOSABLE_RAW_1P) << 16))
+scanlineSM.TxPut(0 | (uint32(COMPOSABLE_EOL_ALIGN) << 16))
+```
+
+This ensures the scanline SM has valid data when it first starts.
+
+### Clock Divider Effects on RAW_RUN
+
+| Divider | PIO Clock | Pixels/Line Time | Result |
+|---------|-----------|------------------|--------|
+| 4 | 31.25 MHz | 41 µs | Full width but timing drift |
+| 2.5 | 50 MHz | 25.6 µs | 2/3 width, "swimming" effect |
+| 2 | 62.5 MHz | 20.5 µs | Half width |
+
+The timing SM runs at divider 4 (31.25 MHz), so the scanline SM should ideally match. However, RAW_RUN with 2 cycles/pixel at 31.25 MHz takes too long for the visible window, causing the RED channel to appear missing (CYAN background, BLACK lines).
+
+### COLOR_RUN vs RAW_RUN
+
+- **COLOR_RUN works correctly** - Solid colors display as expected
+- **RAW_RUN has RED channel issue** - Shows CYAN instead of WHITE, BLACK instead of RED
+
+The difference: COLOR_RUN outputs color once and holds with sticky output during delay loop. RAW_RUN outputs each pixel individually, which may be affected by timing alignment with the visible window.
+
+### Workflow Notes
+
+Effective development workflow for Pico VGA:
+1. Build: `tinygo build -target=pico -o hello.uf2 hello_world.go`
+2. Reboot to bootloader: `echo 'r' > /dev/ttyACM0`
+3. Flash: `picotool load hello.uf2 -x`
+4. Monitor: `mcu mon -m /dev/ttyACM0 -b 115200`
+
+### Prototype Saved
+
+`prototypes/hello_world_swimming_effect.go` - Version with clock divider 2.5 that created interesting "swimming through background" visual effect.
+
+### Outstanding Issues
+
+1. **RED channel not working with RAW_RUN** - CYAN background instead of WHITE
+2. **Pixel timing vs visible window alignment** - Need to understand why COLOR_RUN works but RAW_RUN doesn't
+3. **Consider using COLOR_RUN for solid regions** - RLE optimization could avoid RAW_RUN issues
