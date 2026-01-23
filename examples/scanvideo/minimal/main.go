@@ -27,12 +27,16 @@ func main() {
 		}
 	}
 
-	// Start video output (launches render goroutine internally)
+	// Launch render loop in goroutine BEFORE enabling video
+	// This gives it time to pre-generate some scanlines
+	go renderLoop()
+
+	// Small delay to let render loop start
+	time.Sleep(50 * time.Millisecond)
+
+	// Start video output (launches video loop goroutine internally)
 	scanvideo.TimingEnable(true)
 	println("Video started")
-
-	// Launch render loop in goroutine (runs on core1)
-	go renderLoop()
 
 	// Main loop handles serial input
 	for {
