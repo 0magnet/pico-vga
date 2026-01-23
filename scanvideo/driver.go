@@ -3,7 +3,7 @@ package scanvideo
 import (
 	"device/rp"
 	"machine"
-	"runtime/interrupt"
+	"runtime"
 	"runtime/volatile"
 	"sync"
 	"unsafe"
@@ -65,18 +65,18 @@ var (
 	yRepeatIndex   uint16
 	yRepeatTarget  uint16
 
-	// Synchronization
-	stateLock sync.Mutex
-
 	// Missing scanline data (blue line shown when buffer not ready)
 	missingData [4]uint32
 
-	// Video enabled flags
-	timingEnabled  bool
-	displayEnabled bool
+	// Synchronization (safe in goroutines, was problematic in interrupt handlers)
+	stateLock sync.Mutex
 
-	// IRQ handler installed flag
-	irqInstalled bool
+	// Video enabled flags (use volatile for goroutine-safe access)
+	timingEnabled  volatile.Register32
+	displayEnabled volatile.Register32
+
+	// Video loop control
+	videoLoopRunning volatile.Register32
 )
 
 // Internal scanline buffer with linked list support
@@ -107,6 +107,7 @@ func Setup(mode *Mode) bool {
 
 // SetupWithTiming initializes the video system with custom timing
 func SetupWithTiming(mode *Mode, t *Timing) bool {
+	println("Setup: starting...")
 	videoMode = *mode
 	timing = t
 
@@ -114,6 +115,7 @@ func SetupWithTiming(mode *Mode, t *Timing) bool {
 		videoMode.YScaleDenom = 1
 	}
 
+	println("Setup: init buffers...")
 	// Initialize scanline buffers
 	for i := 0; i < ScanlineBufferCount; i++ {
 		scanlineBuffers[i].core.Data = scanlineBuffers[i].data[:]
@@ -130,14 +132,17 @@ func SetupWithTiming(mode *Mode, t *Timing) bool {
 	missingData[1] = uint32(mode.Width-3) | (uint32(OffsetRaw1P) << 16)
 	missingData[2] = 0 | (uint32(OffsetEOLAlign) << 16)
 
+	println("Setup: get PIO...")
 	// Get PIO instance
 	videoPIO = pio.PIO0
 
+	println("Setup: enable DMA...")
 	// Enable DMA
 	rp.RESETS.RESET.ClearBits(rp.RESETS_RESET_DMA)
 	for !rp.RESETS.RESET_DONE.HasBits(rp.RESETS_RESET_DONE_DMA) {
 	}
 
+	println("Setup: configure GPIO pins...")
 	// Configure GPIO pins
 	for i := uint8(0); i < ColorPinCount; i++ {
 		pin := machine.Pin(uint8(ColorPinBase) + i)
@@ -148,6 +153,7 @@ func SetupWithTiming(mode *Mode, t *Timing) bool {
 		pin.Configure(machine.PinConfig{Mode: videoPIO.PinMode()})
 	}
 
+	println("Setup: load scanline PIO program...")
 	// Load and configure scanline PIO program
 	scanlineProgram := BuildScanlineProgram(mode.XScale)
 	var err error
@@ -158,10 +164,12 @@ func SetupWithTiming(mode *Mode, t *Timing) bool {
 	}
 	scanlineOffset = offset
 
+	println("Setup: configure scanline SM...")
 	scanlineSM := videoPIO.StateMachine(ScanlineSM)
 	scanlineSM.TryClaim()
 	ConfigureScanlineSM(videoPIO, scanlineSM, scanlineOffset)
 
+	println("Setup: load timing PIO program...")
 	// Load and configure timing PIO program
 	timingProgram := BuildTimingProgram()
 	offset, err = videoPIO.AddProgram(timingProgram, -1)
@@ -171,18 +179,28 @@ func SetupWithTiming(mode *Mode, t *Timing) bool {
 	}
 	timingOffset = offset
 
+	println("Setup: configure timing SM...")
 	timingSM := videoPIO.StateMachine(TimingSM)
 	timingSM.TryClaim()
 	ConfigureTimingSM(videoPIO, timingSM, timingOffset)
 
+	println("Setup: configure DMA...")
 	// Configure DMA for scanline data transfer
 	setupDMA()
 
+	println("Setup: init timing state...")
 	// Initialize timing state
 	initTimingState()
 
-	displayEnabled = true
+	displayEnabled.Set(1)
 
+	// Initialize scanline tracking
+	yRepeatTarget = uint16(videoMode.YScale)
+	yRepeatIndex = 0
+	nextScanlineID = 0
+	lastScanlineID = 0xFFFFFFFF
+
+	println("Setup: complete!")
 	return true
 }
 
@@ -305,25 +323,15 @@ func setupDMAStatesActive() {
 
 // TimingEnable starts or stops video timing
 // This follows the same sequence as the C pico-extras implementation
+// Uses polling in a goroutine (like working color_run example) instead of
+// hardware interrupts to avoid mutex issues in interrupt context
 func TimingEnable(enable bool) {
-	if enable == timingEnabled {
+	if enable && timingEnabled.Get() != 0 {
 		return
 	}
-
-	// Install IRQ handlers if not done yet
-	if !irqInstalled {
-		// PIO0 IRQ 0: handles active/vblank scanline IRQs from timing program
-		interrupt.New(rp.IRQ_PIO0_IRQ_0, pioIRQHandler).Enable()
-		// PIO0 IRQ 1: handles timing FIFO refill (TX not full)
-		interrupt.New(rp.IRQ_PIO0_IRQ_1, pioFIFOHandler).Enable()
-		irqInstalled = true
+	if !enable && timingEnabled.Get() == 0 {
+		return
 	}
-
-	// Enable PIO IRQ sources
-	// For IRQ0: enable interrupt0 and interrupt1 (from timing program's IRQ instructions)
-	rp.PIO0.IRQ0_INTE.SetBits(0x03)
-	// For IRQ1: enable timing SM TX FIFO not full
-	rp.PIO0.IRQ1_INTE.SetBits(1 << (8 + TimingSM))
 
 	// Get state machine references
 	timingSM := videoPIO.StateMachine(TimingSM)
@@ -347,6 +355,12 @@ func TimingEnable(enable bool) {
 		// Prime the timing FIFO with initial data
 		topUpTimingFIFO()
 
+		// Pre-fill scanline FIFO with blank data (matches working example)
+		// This ensures the first scanline has data ready
+		scanlineSM.TxPut(uint32(OffsetColorRun) | (0 << 16))                      // COLOR_RUN | BLACK
+		scanlineSM.TxPut(uint32(videoMode.Width-3) | (uint32(OffsetRaw1P) << 16)) // count | RAW_1P
+		scanlineSM.TxPut(0 | (uint32(OffsetEOLAlign) << 16))                      // BLACK | EOL_ALIGN
+
 		// Force scanline SM to jump to entry point (wait IRQ instruction)
 		// This ensures it starts waiting for the timing IRQ
 		scanlineSM.Exec(encodeJmp(scanlineOffset + OffsetEntryPoint))
@@ -357,14 +371,18 @@ func TimingEnable(enable bool) {
 		// Enable both state machines
 		timingSM.SetEnabled(true)
 		scanlineSM.SetEnabled(true)
-	}
 
-	timingEnabled = enable
-
-	if !enable {
-		// Disable IRQs
-		rp.PIO0.IRQ0_INTE.ClearBits(0x03)
-		rp.PIO0.IRQ1_INTE.ClearBits(1 << (8 + TimingSM))
+		// Start the video loop goroutine
+		timingEnabled.Set(1)
+		videoLoopRunning.Set(1)
+		go videoLoop()
+	} else {
+		// Stop the video loop
+		timingEnabled.Set(0)
+		// Wait for video loop to stop
+		for videoLoopRunning.Get() != 0 {
+			// busy wait
+		}
 	}
 }
 
@@ -374,30 +392,40 @@ func encodeJmp(addr uint8) uint16 {
 	return uint16(addr) & 0x1F
 }
 
-// pioIRQHandler handles PIO IRQs for active/vblank scanline start
-//go:nosplit
-func pioIRQHandler(intr interrupt.Interrupt) {
-	irqFlags := videoPIO.GetIRQ()
+// videoLoop is the main video processing loop running in a goroutine
+// This uses polling instead of hardware interrupts (same pattern as working color_run example)
+func videoLoop() {
+	// Give render goroutine time to pre-generate some scanlines
+	for i := 0; i < 100; i++ {
+		runtime.Gosched()
+	}
 
-	// IRQ 0: Active scanline start
-	if irqFlags&1 != 0 {
-		videoPIO.ClearIRQ(1)
-		if displayEnabled {
-			prepareForActiveScanline()
+	for timingEnabled.Get() != 0 {
+		// Keep timing FIFO fed
+		topUpTimingFIFO()
+
+		// Poll for PIO IRQ flags
+		irqFlags := videoPIO.GetIRQ()
+
+		// IRQ 0: Active scanline start
+		if irqFlags&1 != 0 {
+			videoPIO.ClearIRQ(1)
+			if displayEnabled.Get() != 0 {
+				prepareForActiveScanline()
+			}
+			// Yield after each scanline to let render goroutine run
+			runtime.Gosched()
+		}
+
+		// IRQ 1: Vblank scanline
+		if irqFlags&2 != 0 {
+			videoPIO.ClearIRQ(2)
+			prepareForVblankScanline()
+			// Yield during vblank to let render goroutine generate scanlines
+			runtime.Gosched()
 		}
 	}
-
-	// IRQ 1: Vblank scanline
-	if irqFlags&2 != 0 {
-		videoPIO.ClearIRQ(3) // Clear both for good measure
-		prepareForVblankScanline()
-	}
-}
-
-// pioFIFOHandler handles timing FIFO refill IRQ
-//go:nosplit
-func pioFIFOHandler(intr interrupt.Interrupt) {
-	topUpTimingFIFO()
+	videoLoopRunning.Set(0)
 }
 
 // topUpTimingFIFO keeps the timing SM FIFO fed

@@ -35,7 +35,7 @@ func BuildTimingProgram() []uint16 {
 		//   pull block              ; Get timing word from FIFO
 		asm.Pull(false, true).Encode(), // 0
 
-		// new_state (offset 1):
+		// new_state (offset 1) - wrap target:
 		//   out exec, 16            ; Execute embedded instruction (sets IRQ)
 		//   out x, 13               ; Get cycle count into X
 		//   out pins, 3             ; Output sync pins (hsync, vsync, den)
@@ -47,10 +47,7 @@ func BuildTimingProgram() []uint16 {
 		//   nop
 		//   jmp x-- loop
 		asm.Nop().Encode(),                    // 4
-		asm.Jmp(pio.JmpXNZeroDec, 4).Encode(), // 5: Delay loop
-
-		//   jmp entry_point
-		asm.Jmp(pio.JmpAlways, 0).Encode(), // 6: Get next timing word
+		asm.Jmp(pio.JmpXNZeroDec, 4).Encode(), // 5: Delay loop - wrap back to offset 1
 	}
 
 	return program
@@ -88,15 +85,13 @@ const (
 func BuildScanlineProgram(xscale uint8) []uint16 {
 	asm := pio.AssemblerV0{}
 
-	// Calculate delay based on xscale
-	// For xscale=1: no extra delay (extra0=0, extra1=0)
-	// For xscale=2: 1 extra cycle (extra0=1, extra1=1)
-	// For xscale=N: N-1 extra cycles
+	// Calculate delay based on xscale (matches C code EXACTLY)
+	// C code: delay0 = 2 * xscale - 2; delay1 = delay0 + 1;
+	// For xscale=1: delay0=0, delay1=1
+	// For xscale=2: delay0=2, delay1=3
 	var extra0, extra1 uint8
-	if xscale > 1 {
-		extra0 = xscale - 1
-		extra1 = xscale - 1
-	}
+	extra0 = 2*xscale - 2
+	extra1 = extra0 + 1
 
 	program := []uint16{
 		// 0: end_of_scanline_skip_ALIGN - discard remaining OSR
@@ -159,6 +154,12 @@ const (
 	COMPOSABLE_RAW_1P_SKIP_ALIGN = OffsetRaw1PSkipAlign
 )
 
+// Timing program wrap points (relative to program start)
+const (
+	TimingWrapTarget = 1 // new_state (out exec) - where wrap goes TO
+	TimingWrapEnd    = 5 // jmp x-- loop - where wrap happens FROM
+)
+
 // ConfigureTimingSM sets up the timing state machine
 func ConfigureTimingSM(p *pio.PIO, sm pio.StateMachine, offset uint8) {
 	cfg := pio.DefaultStateMachineConfig()
@@ -170,9 +171,13 @@ func ConfigureTimingSM(p *pio.PIO, sm pio.StateMachine, offset uint8) {
 	cfg.SetOutShift(true, true, 32)
 
 	// Set clock divider for pixel clock
-	// 125MHz / 5 = 25MHz (for 640x480@60Hz which needs 25.175MHz)
-	// This gives 31.468 kHz HSYNC (800 pixels @ 25MHz = 32us/line = 31250 Hz)
-	cfg.SetClkDivIntFrac(5, 0)
+	// 125MHz / 4 = 31.25MHz (matches working example timing)
+	cfg.SetClkDivIntFrac(4, 0)
+
+	// Set wrap points: wrap from jmp x-- back to new_state (skip initial pull)
+	wrapBottom := offset + TimingWrapTarget
+	wrapTop := offset + TimingWrapEnd
+	cfg.SetWrap(wrapBottom, wrapTop)
 
 	// Configure pins
 	for i := uint8(0); i < 2; i++ {
@@ -197,8 +202,11 @@ func ConfigureScanlineSM(p *pio.PIO, sm pio.StateMachine, offset uint8) {
 	// Join FIFOs for 8-deep TX
 	cfg.SetFIFOJoin(pio.FifoJoinTx)
 
-	// Same clock as timing
-	cfg.SetClkDivIntFrac(5, 0)
+	// Same clock as timing (125MHz / 4 = 31.25MHz)
+	cfg.SetClkDivIntFrac(4, 0)
+
+	// Enable sticky output - continuously assert OUT pins (matches C scanvideo)
+	cfg.SetOutSpecial(true, false, 0)
 
 	// Configure RGB pins
 	for i := uint8(0); i < ColorPinCount; i++ {
