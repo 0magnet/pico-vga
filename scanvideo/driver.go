@@ -72,6 +72,10 @@ var (
 	// Video enabled flags (use volatile for interrupt-safe access)
 	timingEnabled  volatile.Register32
 	displayEnabled volatile.Register32
+
+	// DMA collision tracking (commented out - enable for debugging)
+	// dmaCollisions     volatile.Register32
+	// dmaTotalTransfers volatile.Register32
 )
 
 // Interrupt handlers - initialized lazily in initInterrupts()
@@ -581,6 +585,14 @@ func prepareForActiveScanline() {
 
 	// Configure and start DMA
 	dma := getDMAChannel(ScanlineDMAChannel)
+
+	// DMA collision check (uncomment for debugging)
+	// BUSY bit is bit 24 in CTRL_TRIG register
+	// if dma.CtrlTrig.Get()&(1<<24) != 0 {
+	// 	dmaCollisions.Set(dmaCollisions.Get() + 1)
+	// }
+	// dmaTotalTransfers.Set(dmaTotalTransfers.Get() + 1)
+
 	dma.ReadAddr.Set(uint32(uintptr(unsafe.Pointer(data))))
 	dma.TransCount.Set(uint32(count))
 	dma.CtrlTrig.SetBits(1) // Enable
@@ -741,3 +753,15 @@ func GetMode() Mode {
 func GetNextScanlineID() uint32 {
 	return nextScanlineID
 }
+
+// GetDMAStats returns DMA collision statistics (uncomment for debugging)
+// Returns (collisions, totalTransfers)
+// func GetDMAStats() (uint32, uint32) {
+// 	return dmaCollisions.Get(), dmaTotalTransfers.Get()
+// }
+
+// ResetDMAStats resets the DMA statistics counters (uncomment for debugging)
+// func ResetDMAStats() {
+// 	dmaCollisions.Set(0)
+// 	dmaTotalTransfers.Set(0)
+// }

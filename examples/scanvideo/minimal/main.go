@@ -16,9 +16,11 @@ var vgaMode = &scanvideo.Mode320x240_60
 func main() {
 	// Initialize serial for debug output and reboot
 	machine.Serial.Configure(machine.UARTConfig{BaudRate: 115200})
-	time.Sleep(500 * time.Millisecond)
+
+	// Wait for USB to enumerate (important for serial output)
+	time.Sleep(2 * time.Second)
+
 	println("scanvideo_minimal starting...")
-	time.Sleep(100 * time.Millisecond)
 
 	// Initialize video
 	if !scanvideo.Setup(vgaMode) {
@@ -35,20 +37,26 @@ func main() {
 	// Small delay to let render loop start
 	time.Sleep(50 * time.Millisecond)
 
-	println("About to enable timing...")
-	time.Sleep(100 * time.Millisecond)
-
-	// Start video output (launches video loop goroutine internally)
+	// Start video output
 	scanvideo.TimingEnable(true)
-
-	time.Sleep(100 * time.Millisecond)
 	println("Video started")
 
 	// LED for visual feedback
 	led := machine.LED
 	led.Configure(machine.PinConfig{Mode: machine.PinOutput})
 
-	// Main loop handles serial input
+	// Serial debug must run in separate goroutine due to TinyGo scheduler
+	// The render loop blocks the main goroutine's serial output otherwise
+	go func() {
+		frameCount := 0
+		for {
+			frameCount++
+			println("Running, frame:", frameCount)
+			time.Sleep(1 * time.Second)
+		}
+	}()
+
+	// Main loop handles serial input and LED
 	counter := 0
 	for {
 		// Toggle LED every ~1 second to show loop is running
