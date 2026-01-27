@@ -125,12 +125,15 @@ func ScanlineNumber(scanlineID uint32) uint16 {
 	return uint16(scanlineID & 0xFFFF)
 }
 
-// RGB565 creates a 16-bit RGB565 color from 8-bit components
+// RGB565 creates a 16-bit color from 8-bit components
+// Format: bits 0-4=Red, 6-10=Green, 11-15=Blue (bit 5 unused)
+// Matches C GVGA_COLOR: (b<<11)|(g<<6)|(r<<0)
 func RGB565(r, g, b uint8) uint16 {
-	return uint16(b>>3)<<11 | uint16(g>>2)<<5 | uint16(r>>3)
+	return uint16(r>>3) | (uint16(g>>3) << 6) | (uint16(b>>3) << 11)
 }
 
-// RGB565_5bit creates a 16-bit RGB565 color from 5-bit components
+// RGB565_5bit creates a 16-bit color from 5-bit R,G,B components
+// Matches C GVGA_COLOR: (b<<11)|(g<<6)|(r<<0)
 func RGB565_5bit(r, g, b uint8) uint16 {
-	return uint16(b)<<11 | uint16(g)<<6 | uint16(r)
+	return uint16(r) | (uint16(g) << 6) | (uint16(b) << 11)
 }

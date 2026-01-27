@@ -15,7 +15,7 @@ import (
 // Configuration constants
 const (
 	ScanlineBufferCount    = 8   // Number of scanline buffers
-	MaxScanlineBufferWords = 320 // Max words per scanline buffer (enough for 640 pixels)
+	MaxScanlineBufferWords = 330 // Max words per scanline buffer (enough for 640 pixels at 1BPP with RAW_RUN)
 
 	// State machine assignments
 	ScanlineSM = 0 // SM0 for scanline output
@@ -72,10 +72,6 @@ var (
 	// Video enabled flags (use volatile for interrupt-safe access)
 	timingEnabled  volatile.Register32
 	displayEnabled volatile.Register32
-
-	// DMA collision tracking (commented out - enable for debugging)
-	// dmaCollisions     volatile.Register32
-	// dmaTotalTransfers volatile.Register32
 )
 
 // Interrupt handlers - initialized lazily in initInterrupts()
@@ -84,6 +80,110 @@ var (
 	irqPIO0_1 interrupt.Interrupt
 	irqsInitialized bool
 )
+
+// Debug counters for diagnosis
+var debugCounters struct {
+	irq0Count       volatile.Register32 // IRQ0 (active scanline) fires
+	irq1Count       volatile.Register32 // IRQ1 (vblank) fires
+	timingFIFOFills volatile.Register32 // Timing FIFO refills
+	dmaStarts       volatile.Register32 // DMA transfers started
+	bufferHits      volatile.Register32 // Scanline buffers used
+	bufferMisses    volatile.Register32 // Missing data used
+	framesComplete  volatile.Register32 // Frames completed
+	lastDataUsed    volatile.Register32 // DataUsed from last buffer
+	lastScanlineNum volatile.Register32 // Last scanline number processed
+}
+
+// DMA buffer capture for verifying actual PIO output
+var dmaCapture struct {
+	enabled   bool
+	captured  bool
+	scanline  uint16
+	dataUsed  uint16
+	words     [20]uint32 // First 20 words sent to DMA/PIO
+}
+
+// EnableDMACapture enables capture of next scanline 0 DMA buffer
+func EnableDMACapture() {
+	dmaCapture.enabled = true
+	dmaCapture.captured = false
+}
+
+// GetDMACapture returns the captured DMA buffer data
+func GetDMACapture() (captured bool, scanline, dataUsed uint16, words [20]uint32) {
+	return dmaCapture.captured, dmaCapture.scanline, dmaCapture.dataUsed, dmaCapture.words
+}
+
+// DebugStats returns current debug counters for diagnosis
+type DebugStats struct {
+	IRQ0Count       uint32
+	IRQ1Count       uint32
+	TimingFIFOFills uint32
+	DMAStarts       uint32
+	BufferHits      uint32
+	BufferMisses    uint32
+	FramesComplete  uint32
+	LastDataUsed    uint32
+	LastScanlineNum uint32
+}
+
+// GetDebugStats returns current debug statistics
+func GetDebugStats() DebugStats {
+	return DebugStats{
+		IRQ0Count:       debugCounters.irq0Count.Get(),
+		IRQ1Count:       debugCounters.irq1Count.Get(),
+		TimingFIFOFills: debugCounters.timingFIFOFills.Get(),
+		DMAStarts:       debugCounters.dmaStarts.Get(),
+		BufferHits:      debugCounters.bufferHits.Get(),
+		BufferMisses:    debugCounters.bufferMisses.Get(),
+		FramesComplete:  debugCounters.framesComplete.Get(),
+		LastDataUsed:    debugCounters.lastDataUsed.Get(),
+		LastScanlineNum: debugCounters.lastScanlineNum.Get(),
+	}
+}
+
+// ResetDebugStats clears all debug counters
+func ResetDebugStats() {
+	debugCounters.irq0Count.Set(0)
+	debugCounters.irq1Count.Set(0)
+	debugCounters.timingFIFOFills.Set(0)
+	debugCounters.dmaStarts.Set(0)
+	debugCounters.bufferHits.Set(0)
+	debugCounters.bufferMisses.Set(0)
+	debugCounters.framesComplete.Set(0)
+}
+
+// PIOStatus contains debug info about PIO state
+type PIOStatus struct {
+	ScanlineSMEnabled bool
+	TimingSMEnabled   bool
+	ScanlineFSTAT     uint32
+	TimingFSTAT       uint32
+	ScanlineAddr      uint32  // Current instruction address
+	TimingAddr        uint32
+	IRQRaw            uint32
+}
+
+// GetPIOStatus returns current PIO state for debugging
+func GetPIOStatus() PIOStatus {
+	// CTRL register bits: SM_ENABLE is at bits 0-3
+	ctrl := rp.PIO0.CTRL.Get()
+	fstat := rp.PIO0.FSTAT.Get()
+
+	// Get SM addresses from SMx_ADDR registers
+	scanlineAddr := rp.PIO0.SM0_ADDR.Get()
+	timingAddr := rp.PIO0.SM3_ADDR.Get()
+
+	return PIOStatus{
+		ScanlineSMEnabled: (ctrl & (1 << ScanlineSM)) != 0,
+		TimingSMEnabled:   (ctrl & (1 << TimingSM)) != 0,
+		ScanlineFSTAT:     fstat,
+		TimingFSTAT:       fstat,
+		ScanlineAddr:      scanlineAddr,
+		TimingAddr:        timingAddr,
+		IRQRaw:            rp.PIO0.IRQ.Get(),
+	}
+}
 
 // Internal scanline buffer with linked list support
 type scanlineBufferInternal struct {
@@ -470,6 +570,7 @@ func isrPIO0_0(irq interrupt.Interrupt) {
 	// Check for IRQ 0: active scanline start
 	if irqFlags&1 != 0 {
 		rp.PIO0.IRQ.Set(1) // Clear IRQ 0
+		debugCounters.irq0Count.Set(debugCounters.irq0Count.Get() + 1)
 		if displayEnabled.Get() != 0 {
 			prepareForActiveScanline()
 		}
@@ -479,6 +580,7 @@ func isrPIO0_0(irq interrupt.Interrupt) {
 	// C code clears both irq0 and irq1 for good measure: video_pio->irq = 3
 	if irqFlags&2 != 0 {
 		rp.PIO0.IRQ.Set(3) // Clear both for good measure like C code
+		debugCounters.irq1Count.Set(debugCounters.irq1Count.Get() + 1)
 		prepareForVblankScanline()
 	}
 }
@@ -499,6 +601,8 @@ func topUpTimingFIFO() {
 	// TimingSM = 3, so bit 19 is TXFULL for timing SM
 	const txFullBit = 1 << (16 + TimingSM)
 
+	debugCounters.timingFIFOFills.Set(debugCounters.timingFIFOFills.Get() + 1)
+
 	for rp.PIO0.FSTAT.Get()&txFullBit == 0 {
 		// Write directly to TX FIFO
 		// TXF3 is the TX FIFO for SM3 (TimingSM)
@@ -515,6 +619,7 @@ func topUpTimingFIFO() {
 					// Start of new frame
 					timingState.timingScanline = 0
 					setupDMAStatesActive()
+					debugCounters.framesComplete.Set(debugCounters.framesComplete.Get() + 1)
 				} else if timingState.timingScanline == timingState.vActive {
 					// Start of vblank
 					setupDMAStatesVblank()
@@ -529,6 +634,10 @@ func topUpTimingFIFO() {
 		}
 	}
 }
+
+// PIO_WAIT_IRQ4 is the encoded instruction at offset 1 (wait irq 4)
+// This is what the scanline SM should be executing when idle
+const PIO_WAIT_IRQ4 = 0x20c4
 
 // prepareForActiveScanline handles the start of an active display line
 // Note: C code comment says this must complete DMA start within ~4.5µs
@@ -577,22 +686,36 @@ func prepareForActiveScanline() {
 	if buf != nil && buf.core.ScanlineID == nextScanlineID {
 		data = &buf.core.Data[0]
 		count = buf.core.DataUsed
+		debugCounters.bufferHits.Set(debugCounters.bufferHits.Get() + 1)
+		debugCounters.lastDataUsed.Set(uint32(count))
 	} else {
 		// Use missing scanline data
 		data = &missingData[0]
 		count = 3
+		debugCounters.bufferMisses.Set(debugCounters.bufferMisses.Get() + 1)
 	}
+
+	scanlineNum := ScanlineNumber(nextScanlineID)
+	debugCounters.lastScanlineNum.Set(uint32(scanlineNum))
+	debugCounters.dmaStarts.Set(debugCounters.dmaStarts.Get() + 1)
+
+	// Capture DMA buffer for debugging (scanline 0 only)
+	if dmaCapture.enabled && !dmaCapture.captured && scanlineNum == 0 && buf != nil {
+		dmaCapture.scanline = scanlineNum
+		dmaCapture.dataUsed = count
+		for i := 0; i < 20 && i < int(count); i++ {
+			dmaCapture.words[i] = buf.core.Data[i]
+		}
+		dmaCapture.captured = true
+		dmaCapture.enabled = false
+	}
+
+	// VIDEO RECOVERY: Clear FIFO and reset SM if needed (matches C scanvideo.c lines 740-765)
+	// This is critical for handling cases where the SM got stuck or has stale data
+	recoverScanlineSM()
 
 	// Configure and start DMA
 	dma := getDMAChannel(ScanlineDMAChannel)
-
-	// DMA collision check (uncomment for debugging)
-	// BUSY bit is bit 24 in CTRL_TRIG register
-	// if dma.CtrlTrig.Get()&(1<<24) != 0 {
-	// 	dmaCollisions.Set(dmaCollisions.Get() + 1)
-	// }
-	// dmaTotalTransfers.Set(dmaTotalTransfers.Get() + 1)
-
 	dma.ReadAddr.Set(uint32(uintptr(unsafe.Pointer(data))))
 	dma.TransCount.Set(uint32(count))
 	dma.CtrlTrig.SetBits(1) // Enable
@@ -613,6 +736,54 @@ func prepareForActiveScanline() {
 		currentBuffer = nil
 	}
 	interrupt.Restore(state)
+}
+
+// recoverScanlineSM checks and recovers the scanline SM if it's in a bad state
+// This matches the C scanvideo.c PICO_SCANVIDEO_ENABLE_VIDEO_RECOVERY code (lines 740-765)
+//go:nosplit
+func recoverScanlineSM() {
+	// FSTAT bit 0 is TXEMPTY for SM0 (ScanlineSM)
+	const txEmptyBit = 1 << ScanlineSM
+
+	// Check if TX FIFO is not empty - indicates stale data from previous scanline
+	if rp.PIO0.FSTAT.Get()&txEmptyBit == 0 {
+		// FIFO not empty - clear it by toggling FJOIN bits in SHIFTCTRL
+		// This is what pio_sm_clear_fifos does in the C SDK
+		shiftctrl := rp.PIO0.SM0_SHIFTCTRL.Get()
+		rp.PIO0.SM0_SHIFTCTRL.Set(shiftctrl ^ (0x3 << 30)) // Toggle FJOIN_TX and FJOIN_RX bits
+		rp.PIO0.SM0_SHIFTCTRL.Set(shiftctrl)              // Restore original
+
+		// Also clear the OSR in case there was partial data
+		// Execute: out null, 32 (opcode 0x6060)
+		rp.PIO0.SM0_INSTR.Set(0x6060)
+	}
+
+	// Check if SM is at the expected wait instruction (offset 1 = wait irq 4)
+	// SM0_INSTR holds the currently executing instruction
+	// SM0_ADDR holds the current program counter
+	currentAddr := rp.PIO0.SM0_ADDR.Get()
+	expectedWaitAddr := uint32(scanlineOffset + OffsetEntryPoint) // offset + 1
+
+	if currentAddr != expectedWaitAddr {
+		// SM is not at the wait instruction - force it back
+		// First try executing a wait irq 4 instruction
+		rp.PIO0.SM0_INSTR.Set(PIO_WAIT_IRQ4)
+
+		// Check if SM is now stalled (waiting for IRQ)
+		// EXECCTRL bit 31 is EXEC_STALLED
+		if rp.PIO0.SM0_EXECCTRL.Get()&(1<<31) != 0 {
+			// SM is stalled on our injected wait - check if it's at the right place
+			// If not at wait+1 (the out pc instruction), jump to wait
+			if rp.PIO0.SM0_ADDR.Get() != expectedWaitAddr+1 {
+				// Jump to wait instruction
+				rp.PIO0.SM0_INSTR.Set(uint32(scanlineOffset + OffsetEntryPoint))
+			}
+		} else {
+			// SM is not stalled, so IRQ must have already fired
+			// Jump to the instruction after wait (out pc, 16)
+			rp.PIO0.SM0_INSTR.Set(uint32(scanlineOffset + OffsetEntryPoint + 1))
+		}
+	}
 }
 
 // prepareForVblankScanline handles vblank scanlines
@@ -754,14 +925,7 @@ func GetNextScanlineID() uint32 {
 	return nextScanlineID
 }
 
-// GetDMAStats returns DMA collision statistics (uncomment for debugging)
-// Returns (collisions, totalTransfers)
-// func GetDMAStats() (uint32, uint32) {
-// 	return dmaCollisions.Get(), dmaTotalTransfers.Get()
-// }
-
-// ResetDMAStats resets the DMA statistics counters (uncomment for debugging)
-// func ResetDMAStats() {
-// 	dmaCollisions.Set(0)
-// 	dmaTotalTransfers.Set(0)
-// }
+// GetProgramOffsets returns the loaded PIO program offsets for debugging
+func GetProgramOffsets() (scanline, timing uint8) {
+	return scanlineOffset, timingOffset
+}

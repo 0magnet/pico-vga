@@ -160,6 +160,13 @@ const (
 	TimingWrapEnd    = 5 // jmp x-- loop - where wrap happens FROM
 )
 
+// Scanline program wrap points (relative to program start)
+// Matches scanvideo.pio: .wrap_target before raw_1p, .wrap after raw_2p
+const (
+	ScanlineWrapTarget = 11 // raw_1p - where wrap goes TO
+	ScanlineWrapEnd    = 13 // raw_2p - where wrap happens FROM
+)
+
 // ConfigureTimingSM sets up the timing state machine
 func ConfigureTimingSM(p *pio.PIO, sm pio.StateMachine, offset uint8) {
 	cfg := pio.DefaultStateMachineConfig()
@@ -207,6 +214,12 @@ func ConfigureScanlineSM(p *pio.PIO, sm pio.StateMachine, offset uint8) {
 
 	// Enable sticky output - continuously assert OUT pins (matches C scanvideo)
 	cfg.SetOutSpecial(true, false, 0)
+
+	// Set wrap points: wrap from raw_2p back to raw_1p
+	// Matches scanvideo.pio: .wrap_target at raw_1p (11), .wrap at raw_2p (13)
+	wrapBottom := offset + ScanlineWrapTarget
+	wrapTop := offset + ScanlineWrapEnd
+	cfg.SetWrap(wrapBottom, wrapTop)
 
 	// Configure RGB pins
 	for i := uint8(0); i < ColorPinCount; i++ {

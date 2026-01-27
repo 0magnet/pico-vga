@@ -4,7 +4,7 @@
 package gvga
 
 import (
-	"sync"
+	"time"
 
 	"github.com/0magnet/pico-vga/scanvideo"
 )
@@ -29,8 +29,8 @@ const (
 // Global palette buffer for fast scanline rendering (matches C _gvga_paletteBuf)
 var paletteBuf [256 * 8]uint16
 
-// Mutex for synchronization between render and draw operations
-var scanningMutex sync.Mutex
+// Package-level variable for render loop (matches scanvideo_minimal pattern)
+var currentGVga *GVga
 
 // Init creates and initializes a GVga context
 func Init(width, height uint16, bits int, doubleBuffer, interlaced bool, userData interface{}) *GVga {
@@ -128,26 +128,95 @@ func (g *GVga) getVgaMode() *scanvideo.Mode {
 }
 
 // Start begins VGA output using scanvideo
+// Simplified to match scanvideo_minimal exactly
 func (g *GVga) Start() {
-	// Setup scanvideo with the appropriate mode
-	mode := g.getVgaMode()
+	println("gvga.Start: entering")
+
+	// Use global mode directly like scanvideo_minimal does
+	var mode *scanvideo.Mode
+	if g.Width == 320 {
+		mode = &scanvideo.Mode320x240_60
+	} else {
+		mode = &scanvideo.Mode640x480_60
+	}
+	println("gvga.Start: width=", g.Width, "using mode width=", mode.Width)
+
 	if !scanvideo.Setup(mode) {
 		println("gvga: scanvideo setup failed")
 		return
 	}
+	println("gvga.Start: Setup succeeded")
 
-	// Enable video timing
-	scanvideo.TimingEnable(true)
-
-	// Start the render loop in a goroutine (runs on core1)
+	// Start render loop BEFORE enabling timing (like scanvideo_minimal)
 	g.running = true
-	go g.renderLoop()
+	currentGVga = g // Store for package-level render function
+	go renderLoopFunc()
+
+	// Small delay to let render loop start (like scanvideo_minimal)
+	time.Sleep(50 * time.Millisecond)
+
+	// Enable video output
+	scanvideo.TimingEnable(true)
+	println("gvga.Start: done")
 }
 
 // Stop stops VGA output
 func (g *GVga) Stop() {
 	g.running = false
 	scanvideo.TimingEnable(false)
+}
+
+// renderLoopFunc is package-level render loop (matches C render_loop in gvga.c)
+func renderLoopFunc() {
+	println("renderLoopFunc: starting")
+	g := currentGVga
+	if g == nil {
+		println("ERROR: currentGVga is nil!")
+		return
+	}
+	println("renderLoopFunc: g.Width=", g.Width, "g.Height=", g.Height, "g.HeaderRows=", g.HeaderRows)
+	isInterlaced := g.Mode&ModeInterlaced != 0
+	oddFrame := false
+
+	for {
+		// Get a scanline buffer (blocks until one is available)
+		buf := scanvideo.BeginScanlineGeneration(true)
+		if buf == nil {
+			continue
+		}
+
+		g.RenderCount++
+		frameNumber := scanvideo.FrameNumber(buf.ScanlineID)
+		scanline := scanvideo.ScanlineNumber(buf.ScanlineID)
+		isEvenScanline := (scanline & 1) == 0
+		oddFrame = (frameNumber & 1) != 0
+
+		// Debug first few renders
+		if g.RenderCount <= 5 {
+			println("render:", g.RenderCount, "scanline:", scanline, "frame:", frameNumber)
+		}
+
+		// Render appropriate content based on scanline position
+		if scanline < g.HeaderRows {
+			// Top border
+			buf.DataUsed = g.renderBlankLine(buf.Data, int(g.Width), int(scanline), g.BorderColors[BorderTop])
+		} else if scanline < g.Height+g.HeaderRows {
+			// Active display region
+			if isInterlaced && (oddFrame != isEvenScanline) {
+				// Interlaced: skip alternate lines
+				buf.DataUsed = g.renderBlankLine(buf.Data, int(g.Width), int(scanline), g.Palette[0])
+			} else {
+				// Render actual content from frame buffer
+				buf.DataUsed = g.renderScanline(buf.Data, int(g.Width), int(scanline-g.HeaderRows))
+			}
+		} else {
+			// Bottom border
+			buf.DataUsed = g.renderBlankLine(buf.Data, int(g.Width), int(scanline), g.BorderColors[BorderBottom])
+		}
+
+		buf.Status = scanvideo.ScanlineOK
+		scanvideo.EndScanlineGeneration(buf)
+	}
 }
 
 // Sync waits for the current frame to finish displaying
@@ -170,12 +239,11 @@ func (g *GVga) Swap(doCopy bool) {
 	g.DrawFrame, g.ShowFrame = g.ShowFrame, g.DrawFrame
 }
 
-// renderLoop is the main VGA rendering loop (runs on core1 via goroutine)
-// This matches the C render_loop() function
-func (g *GVga) renderLoop() {
-	isInterlaced := g.Mode&ModeInterlaced != 0
-	isBlocked := false
-	oddFrame := false
+// renderLoopInternal is the main VGA rendering loop (runs on core1 via goroutine)
+// Simplified to match scanvideo_minimal exactly for debugging
+func (g *GVga) renderLoopInternal() {
+	println("gvga.renderLoopInternal: starting")
+	scanlineCount := uint32(0)
 
 	for g.running {
 		// Get a scanline buffer from scanvideo
@@ -184,44 +252,28 @@ func (g *GVga) renderLoop() {
 			continue
 		}
 
-		frameNumber := scanvideo.FrameNumber(buf.ScanlineID)
+		scanlineCount++
+		g.RenderCount = scanlineCount
+
 		scanline := scanvideo.ScanlineNumber(buf.ScanlineID)
-		isEvenScanline := (scanline & 1) == 0
-		oddFrame = (frameNumber & 1) != 0
 
-		// Lock during active display region
-		if scanline == 0 && !isBlocked {
-			scanningMutex.Lock()
-			isBlocked = true
+		// Debug: print periodically
+		if scanlineCount%10000 == 1 {
+			println("gvga: scanline", scanline, "Width", g.Width)
 		}
 
-		// Render the appropriate content for this scanline
-		if scanline < g.HeaderRows {
-			// Top border
-			buf.DataUsed = g.renderBlankLine(buf.Data, int(g.Width), int(scanline), g.BorderColors[BorderTop])
-		} else if scanline < g.Height+g.HeaderRows {
-			// Active display region
-			if isInterlaced && (oddFrame != isEvenScanline) {
-				// Interlaced: skip alternate lines
-				buf.DataUsed = g.renderBlankLine(buf.Data, int(g.Width), int(scanline), g.Palette[0])
-			} else {
-				// Render actual content
-				buf.DataUsed = g.renderScanline(buf.Data, int(g.Width), int(scanline-g.HeaderRows))
-			}
-		} else {
-			// Bottom border
-			buf.DataUsed = g.renderBlankLine(buf.Data, int(g.Width), int(scanline), g.BorderColors[BorderBottom])
-		}
-
+		// Simplified render - directly write to buf.Data like scanvideo_minimal does
+		// Use scanvideo's constants directly to match exactly
+		bgColor := uint32(0x001F) // RED for visibility
+		buf.Data[0] = uint32(scanvideo.COMPOSABLE_COLOR_RUN) | (bgColor << 16)
+		buf.Data[1] = uint32(g.Width-3) | (uint32(scanvideo.COMPOSABLE_RAW_1P) << 16)
+		buf.Data[2] = 0 | (uint32(scanvideo.COMPOSABLE_EOL_ALIGN) << 16)
+		buf.DataUsed = 3
 		buf.Status = scanvideo.ScanlineOK
-		scanvideo.EndScanlineGeneration(buf)
 
-		// Unlock at end of active region
-		if scanline >= g.Height-1 && isBlocked {
-			scanningMutex.Unlock()
-			isBlocked = false
-		}
+		scanvideo.EndScanlineGeneration(buf)
 	}
+	println("gvga.renderLoopInternal: exiting")
 }
 
 // renderScanline dispatches to the appropriate bit-depth renderer
@@ -240,58 +292,72 @@ func (g *GVga) renderScanline(buf []uint32, width, scanline int) uint16 {
 	}
 }
 
-// renderScanline1BPP renders a 1bpp scanline (matches C _scanline_render_1bpp)
-func (g *GVga) renderScanline1BPP(buf []uint32, width, scanline int) uint16 {
-	ptr := 0
-	isTextMode := g.Mode&ModeText != 0
+// Test configuration for RAW_RUN pixel count (must be multiple of 8)
+var TestRawPixels = 8
 
-	var row []byte
-	var fontLine int
-	var fontData []byte
+// UseColorRunFor1BPP enables simpler COLOR_RUN rendering instead of RAW_RUN for debugging
+// Set to false to use RAW_RUN (matching C source _scanline_render_1bpp)
+var UseColorRunFor1BPP = false // Use RAW_RUN to match C source
+
+// renderScanline1BPP renders a 1bpp scanline
+// When UseColorRunFor1BPP is true, uses simple COLOR_RUN (for debugging)
+// When false, uses RAW_RUN matching C _scanline_render_1bpp exactly
+func (g *GVga) renderScanline1BPP(buf []uint32, width, scanline int) uint16 {
+	if UseColorRunFor1BPP {
+		return g.renderScanline1BPP_ColorRun(buf, width, scanline)
+	}
+	return g.renderScanline1BPP_RawRun(buf, width, scanline)
+}
+
+// renderScanline1BPP_ColorRun uses simple COLOR_RUN for solid lines
+// This is simpler and more reliable for debugging
+func (g *GVga) renderScanline1BPP_ColorRun(buf []uint32, width, scanline int) uint16 {
+	idx := scanline * width / _8_PIXELS_PER_BYTE
+
+	// Check first byte to determine dominant color
+	var color uint16
+	if g.ShowFrame[idx] == 0xFF {
+		color = uint16(g.Palette[1]) // All 1s = color 1
+	} else {
+		color = uint16(g.Palette[0]) // All 0s = color 0
+	}
+
+	// Simple COLOR_RUN for the whole line
+	buf[0] = uint32(COMPOSABLE_COLOR_RUN) | (uint32(color) << 16)
+	buf[1] = uint32(width-3) | (uint32(COMPOSABLE_RAW_1P) << 16)
+	buf[2] = 0 | (uint32(COMPOSABLE_EOL_ALIGN) << 16)
+	return 3
+}
+
+// renderScanline1BPP_RawRun renders using RAW_RUN (matches C _scanline_render_1bpp exactly)
+func (g *GVga) renderScanline1BPP_RawRun(buf []uint32, width, scanline int) uint16 {
+	ptr := 0
+	idx := scanline * width / _8_PIXELS_PER_BYTE
+	row := g.ShowFrame[idx:]
 	cols := width / _8_PIXELS_PER_BYTE
 
-	if isTextMode {
-		charRow := scanline / int(g.Font.Height)
-		fontLine = scanline % int(g.Font.Height)
-		fontData = g.Font.Data
-		idx := charRow * int(g.Cols)
-		row = g.ShowFrame[idx:]
-		cols = int(g.Cols)
-	} else {
-		idx := scanline * width / _8_PIXELS_PER_BYTE
-		row = g.ShowFrame[idx:]
-	}
-
-	// Get first byte
-	var b byte
-	if isTextMode {
-		charIdx := row[0]
-		b = fontData[int(charIdx)*int(g.Font.Height)+fontLine]
-	} else {
-		b = row[0]
-	}
+	// First byte - 8 pixels
+	b := row[0]
 	colors := paletteBuf[int(b)*_8_PIXELS_PER_BYTE:]
+	rowIdx := 1
 
-	// RAW_RUN header
-	buf[ptr] = uint32(COMPOSABLE_RAW_RUN) | (uint32(colors[0]) << 16)
+	// RAW_RUN header + first 8 pixels
+	buf[ptr] = uint32(COMPOSABLE_RAW_RUN) | (uint32(colors[0]) << 16) // RAW_RUN | p0
 	ptr++
-	buf[ptr] = uint32(width-3) | (uint32(colors[1]) << 16)
+	buf[ptr] = uint32(width-3) | (uint32(colors[1]) << 16) // count | p1
 	ptr++
-	buf[ptr] = uint32(colors[2]) | (uint32(colors[3]) << 16)
+	buf[ptr] = uint32(colors[2]) | (uint32(colors[3]) << 16) // p2 | p3
 	ptr++
-	buf[ptr] = uint32(colors[4]) | (uint32(colors[5]) << 16)
+	buf[ptr] = uint32(colors[4]) | (uint32(colors[5]) << 16) // p4 | p5
 	ptr++
-	buf[ptr] = uint32(colors[6]) | (uint32(colors[7]) << 16)
+	buf[ptr] = uint32(colors[6]) | (uint32(colors[7]) << 16) // p6 | p7
 	ptr++
+	cols--
 
-	// Remaining bytes
-	for i := 1; i < cols; i++ {
-		if isTextMode {
-			charIdx := row[i]
-			b = fontData[int(charIdx)*int(g.Font.Height)+fontLine]
-		} else {
-			b = row[i]
-		}
+	// Remaining bytes (8 pixels each)
+	for i := 0; i < cols; i++ {
+		b = row[rowIdx]
+		rowIdx++
 		colors = paletteBuf[int(b)*_8_PIXELS_PER_BYTE:]
 
 		buf[ptr] = uint32(colors[0]) | (uint32(colors[1]) << 16)
@@ -304,7 +370,7 @@ func (g *GVga) renderScanline1BPP(buf []uint32, width, scanline int) uint16 {
 		ptr++
 	}
 
-	// End of line
+	// End of line - must end with black pixel
 	buf[ptr] = uint32(COMPOSABLE_RAW_1P) | (0 << 16)
 	ptr++
 	buf[ptr] = uint32(COMPOSABLE_EOL_ALIGN) << 16
@@ -412,11 +478,11 @@ func (g *GVga) renderScanline8BPP(buf []uint32, width, scanline int) uint16 {
 	return uint16(ptr)
 }
 
-// renderBlankLine renders a solid color line (matches C _scanline_render_blank_line)
+// renderBlankLine renders a solid color line (matches C _scanline_render_blank_line exactly)
 func (g *GVga) renderBlankLine(buf []uint32, width, scanline int, color Color) uint16 {
 	ptr := 0
 
-	// COLOR_RUN for solid color
+	// COLOR_RUN format matching C exactly
 	buf[ptr] = uint32(COMPOSABLE_COLOR_RUN) | (uint32(color) << 16)
 	ptr++
 	buf[ptr] = uint32(width-5) | (uint32(COMPOSABLE_RAW_2P) << 16)
@@ -425,6 +491,7 @@ func (g *GVga) renderBlankLine(buf []uint32, width, scanline int, color Color) u
 	ptr++
 	buf[ptr] = uint32(COMPOSABLE_RAW_1P) | (0 << 16)
 	ptr++
+	// Note: must end with a black pixel
 	buf[ptr] = uint32(COMPOSABLE_EOL_ALIGN) << 16
 	ptr++
 
@@ -488,4 +555,29 @@ func (g *GVga) Destroy() {
 	g.DrawFrame = nil
 	g.ShowFrame = nil
 	g.Palette = nil
+}
+
+// DebugPaletteBuf returns the first n entries from the global paletteBuf for debugging
+func DebugPaletteBuf(n int) []uint16 {
+	if n > len(paletteBuf) {
+		n = len(paletteBuf)
+	}
+	result := make([]uint16, n)
+	copy(result, paletteBuf[:n])
+	return result
+}
+
+// DebugRenderScanline renders a single scanline to a provided buffer and returns debug info
+func (g *GVga) DebugRenderScanline(scanline int) (dataUsed uint16, firstWords [8]uint32) {
+	buf := make([]uint32, 400) // Large enough for any scanline
+	dataUsed = g.renderScanline(buf, int(g.Width), scanline)
+	for i := 0; i < 8 && i < len(buf); i++ {
+		firstWords[i] = buf[i]
+	}
+	return
+}
+
+// DebugRenderScanlineFull renders a scanline into the provided buffer and returns dataUsed
+func (g *GVga) DebugRenderScanlineFull(scanline int, buf []uint32) uint16 {
+	return g.renderScanline(buf, int(g.Width), scanline)
 }

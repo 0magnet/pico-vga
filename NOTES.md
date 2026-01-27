@@ -982,3 +982,109 @@ tinygo build -target=pico -o hello.uf2 hello_world.go 2>&1 && echo 'r' > /dev/tt
 1. **RED channel not working with RAW_RUN** - CYAN background instead of WHITE
 2. **Pixel timing vs visible window alignment** - Need to understand why COLOR_RUN works but RAW_RUN doesn't
 3. **Consider using COLOR_RUN for solid regions** - RLE optimization could avoid RAW_RUN issues
+
+---
+
+## Session Notes (2026-01-24) - RAW_RUN Debugging
+
+### Current Problem
+
+The gvga library's RAW_RUN format produces "mostly white but faded screen with jittering black bars on edges" while the simpler COLOR_RUN format works perfectly.
+
+### What Works
+- scanvideo library port is complete and working
+- scanvideo minimal example displays correctly (uses COLOR_RUN)
+- COLOR_RUN with `count = width-3` works perfectly (solid white screen)
+
+### What Doesn't Work
+- RAW_RUN format produces display artifacts regardless of count value tested:
+  - `count = width-3 = 317`: Black bars more pronounced on right
+  - `count = width-2 = 318`: Similar issues
+  - `count = width-1 = 319`: Mostly white but faded, jittering black bars on right
+
+### Key C Code Analysis (`_gvga_scanlines.c`)
+
+```c
+// For 1bpp with width=320:
+push0(buf, COMPOSABLE_RAW_RUN);
+push1(buf, *colors++);    // pixel0
+push0(buf, width-3);      // count = 317
+push1(buf, *colors++);    // pixel1
+// ... pixels 2-7 from first byte (6 more pixels)
+// cols-- (39 remaining)
+// Loop 39 times × 8 pixels = 312 pixels
+// Total: 8 + 312 = 320 pixels of data
+
+push0(buf, COMPOSABLE_RAW_1P);
+push1(buf, 0);
+push32(buf, COMPOSABLE_EOL_ALIGN);
+```
+
+### Pixel Count Discrepancy
+
+**C provides 320 pixels but RAW_RUN with count=317 only outputs 318:**
+- Offset 7: output pixel0 (1 pixel)
+- Offset 8: load count = 317
+- Offset 9-10 loop: 317 iterations outputting pixels 1-317
+- Total from RAW_RUN: 1 + 317 = 318 pixels
+
+**Remaining 2 pixels (318-319) overflow into RAW_1P handling:**
+- After loop ends, OSR is empty (pixel317 was from high bits, OSR cleared)
+- At offset 11 (RAW_1P fallthrough), autopull loads next word
+- BUT next word is pixels 318-319, NOT the RAW_1P|0 word!
+- So pixel318 gets output, pixel319 becomes the jump target!
+
+**If pixel319 = White (0xFFDF):**
+- Jump target = 0xFFDF & 0x1F = 31 (out of bounds for 16-instruction program!)
+- This should cause erratic behavior
+
+**Mystery:** Why does the C code work? This remains unresolved.
+
+### PIO Program Flow (for reference)
+
+```
+Offset 7:  OUT PINS 16        ; raw_run - output pixel0
+Offset 8:  OUT X 16           ; load count
+Offset 9:  OUT PINS 16        ; pixel_loop - output pixel
+Offset 10: JMP X-- 9          ; loop back
+Offset 11: OUT PINS 16        ; raw_1p (fallthrough from raw_run!)
+Offset 12: OUT PC 16          ; next command
+```
+
+### Current Test Code State
+
+`gvga/gvga.go` renderScanline1BPP is simplified to output solid white:
+- count = width-1 = 319
+- 320 pixels of white data (2 header + 159 word pairs)
+- EOL word: 0 | (EOL_ALIGN << 16)
+
+Result: "Mostly white with jittering black bars on right edge"
+
+### Possible Explanations to Investigate
+
+1. **C code might use different video mode/timing** that masks the overflow
+2. **C pico-extras scanvideo might have different PIO program behavior**
+3. **The xscale=2 (320x240 mode) timing might be different**
+4. **DMA/FIFO timing differences between C and TinyGo**
+
+### Files to Reference
+
+- C source: `/home/d0mo/go/src/github.com/drfrancintosh/GVga/libs/gvga/_gvga_scanlines.c`
+- TinyGo gvga: `/home/d0mo/go/src/github.com/0magnet/pico-vga/gvga/gvga.go`
+- TinyGo scanvideo PIO: `/home/d0mo/go/src/github.com/0magnet/pico-vga/scanvideo/pio.go`
+- Working minimal example: `/home/d0mo/go/src/github.com/0magnet/pico-vga/examples/scanvideo/minimal/main.go`
+
+### Commands to Resume
+
+```bash
+cd /home/d0mo/go/src/github.com/0magnet/pico-vga/examples/gvga/hello_world_lib
+tinygo build -target=pico -o hello_world.uf2 .
+picotool load hello_world.uf2 -f && picotool reboot
+```
+
+### Next Steps
+
+1. Check actual pico-extras scanvideo.pio source to verify PIO program matches
+2. Look for C gvga initialization that might explain the count/pixel relationship
+3. Verify if C code uses different width than 320
+4. Consider if the pixel overflow is somehow handled differently in C timing

@@ -8,29 +8,34 @@ import (
 	"github.com/0magnet/pico-vga/scanvideo"
 )
 
-// Color is RGB565 format (5 bits red, 6 bits green, 5 bits blue)
+// Color is 16-bit RGB format matching C GVGA_COLOR macro
+// Format: bits 0-4=Red, 6-10=Green, 11-15=Blue (note: bit 5 unused)
+// Matches C: #define GVGA_COLOR(r,g,b) (((b)<<11u)|((g)<<6)|((r)<<0))
 type Color uint16
 
-// RGB creates a Color from 5-bit R, 6-bit G, 5-bit B values
+// RGB creates a Color from 5-bit R, 5-bit G, 5-bit B values
+// Matches C: GVGA_COLOR(r,g,b) = (b<<11)|(g<<6)|(r<<0)
 func RGB(r, g, b uint8) Color {
-	return Color((uint16(b&0x1F) << 11) | (uint16(g&0x3F) << 5) | uint16(r&0x1F))
+	return Color(uint16(r&0x1F) | (uint16(g&0x1F) << 6) | (uint16(b&0x1F) << 11))
 }
 
-// RGB5 creates a Color from 5-bit R, G, B values (G scaled to 6-bit)
+// RGB5 creates a Color from 5-bit R, G, B values
+// Matches C: GVGA_COLOR(r,g,b) = (b<<11)|(g<<6)|(r<<0)
 func RGB5(r, g, b uint8) Color {
-	return Color((uint16(b&0x1F) << 11) | (uint16(g&0x1F) << 6) | uint16(r&0x1F))
+	return Color(uint16(r&0x1F) | (uint16(g&0x1F) << 6) | (uint16(b&0x1F) << 11))
 }
 
-// Standard colors
+// Standard colors - matches C GVGA_COLOR format: bits 0-4=Red, 6-10=Green, 11-15=Blue
+// GVGA_COLOR(r,g,b) = (b<<11)|(g<<6)|(r<<0)
 const (
-	Black   Color = 0x0000
-	Red     Color = 0x001F // RGB5(31, 0, 0)
-	Green   Color = 0x07C0 // RGB5(0, 31, 0)
-	Blue    Color = 0xF800 // RGB5(0, 0, 31)
-	Cyan    Color = 0xFFC0 // RGB5(0, 31, 31)
-	Magenta Color = 0xF81F // RGB5(31, 0, 31)
-	Yellow  Color = 0x07DF // RGB5(31, 31, 0)
-	White   Color = 0xFFFF // RGB5(31, 31, 31)
+	Black   Color = 0x0000                   // GVGA_COLOR(0, 0, 0)
+	Red     Color = 0x001F                   // GVGA_COLOR(31, 0, 0) = 31 << 0
+	Green   Color = 0x07C0                   // GVGA_COLOR(0, 31, 0) = 31 << 6
+	Blue    Color = 0xF800                   // GVGA_COLOR(0, 0, 31) = 31 << 11
+	Cyan    Color = 0xFFC0                   // GVGA_COLOR(0, 31, 31) = Green | Blue
+	Magenta Color = 0xF81F                   // GVGA_COLOR(31, 0, 31) = Red | Blue
+	Yellow  Color = 0x07DF                   // GVGA_COLOR(31, 31, 0) = Red | Green
+	White   Color = 0xFFDF                   // GVGA_COLOR(31, 31, 31)
 )
 
 // Mode flags
@@ -139,10 +144,11 @@ type GVga struct {
 	UserData interface{}
 
 	// Internal state
-	running    bool
-	lineCount  uint16
-	frameCount uint32
-	vgaMode    *scanvideo.Mode
+	running       bool
+	lineCount     uint16
+	frameCount    uint32
+	vgaMode       *scanvideo.Mode
+	RenderCount   uint32 // Public counter for debug
 }
 
 // ScanlineRenderFunc is the function signature for scanline renderers
