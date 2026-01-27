@@ -431,13 +431,13 @@ func (g *GVga) renderScanline2BPP(buf []uint32, width, scanline int) uint16 {
 		ptr++
 	}
 
-	// End of line
-	buf[ptr] = uint32(COMPOSABLE_RAW_1P) | (0 << 16)
+	// End of line - push0/push1/push32 pattern
+	buf[ptr] = uint32(COMPOSABLE_RAW_1P) // push0
+	buf[ptr] |= 0 << 16                  // push1 (black pixel)
 	ptr++
-	buf[ptr] = uint32(COMPOSABLE_EOL_ALIGN) // LOW 16 bits for PIO
-	ptr++
+	buf[ptr] = uint32(COMPOSABLE_EOL_ALIGN) << 16 // push32 (HIGH bits, no ptr++)
 
-	return uint16(ptr)
+	return uint16(ptr) // Match C: return ptr, not ptr+1
 }
 
 // renderScanline4BPP renders a 4bpp scanline (matches C _scanline_render_4bpp)
@@ -465,13 +465,13 @@ func (g *GVga) renderScanline4BPP(buf []uint32, width, scanline int) uint16 {
 		ptr++
 	}
 
-	// End of line
-	buf[ptr] = uint32(COMPOSABLE_RAW_1P) | (0 << 16)
+	// End of line - push0/push1/push32 pattern
+	buf[ptr] = uint32(COMPOSABLE_RAW_1P) // push0
+	buf[ptr] |= 0 << 16                  // push1 (black pixel)
 	ptr++
-	buf[ptr] = uint32(COMPOSABLE_EOL_ALIGN) // LOW 16 bits for PIO
-	ptr++
+	buf[ptr] = uint32(COMPOSABLE_EOL_ALIGN) << 16 // push32 (HIGH bits, no ptr++)
 
-	return uint16(ptr)
+	return uint16(ptr) // Match C: return ptr, not ptr+1
 }
 
 // renderScanline8BPP renders an 8bpp scanline (matches C _scanline_render_8bpp)
@@ -492,33 +492,36 @@ func (g *GVga) renderScanline8BPP(buf []uint32, width, scanline int) uint16 {
 		ptr++
 	}
 
-	// End of line
-	buf[ptr] = uint32(COMPOSABLE_RAW_1P) | (0 << 16)
+	// End of line - push0/push1/push32 pattern
+	buf[ptr] = uint32(COMPOSABLE_RAW_1P) // push0
+	buf[ptr] |= 0 << 16                  // push1 (black pixel)
 	ptr++
-	buf[ptr] = uint32(COMPOSABLE_EOL_ALIGN) // LOW 16 bits for PIO
-	ptr++
+	buf[ptr] = uint32(COMPOSABLE_EOL_ALIGN) << 16 // push32 (HIGH bits, no ptr++)
 
-	return uint16(ptr)
+	return uint16(ptr) // Match C: return ptr, not ptr+1
 }
 
 // renderBlankLine renders a solid color line (matches C _scanline_render_blank_line exactly)
 func (g *GVga) renderBlankLine(buf []uint32, width, scanline int, color Color) uint16 {
 	ptr := 0
 
-	// COLOR_RUN format matching C exactly
-	buf[ptr] = uint32(COMPOSABLE_COLOR_RUN) | (uint32(color) << 16)
+	// COLOR_RUN format matching C exactly using push0/push1/push32 pattern
+	buf[ptr] = uint32(COMPOSABLE_COLOR_RUN) // push0
+	buf[ptr] |= uint32(color) << 16         // push1
 	ptr++
-	buf[ptr] = uint32(width-5) | (uint32(COMPOSABLE_RAW_2P) << 16)
+	buf[ptr] = uint32(width - 5)               // push0
+	buf[ptr] |= uint32(COMPOSABLE_RAW_2P) << 16 // push1
 	ptr++
-	buf[ptr] = uint32(color) | (uint32(color) << 16)
+	buf[ptr] = uint32(color)         // push0
+	buf[ptr] |= uint32(color) << 16  // push1
 	ptr++
-	buf[ptr] = uint32(COMPOSABLE_RAW_1P) | (0 << 16)
+	buf[ptr] = uint32(COMPOSABLE_RAW_1P) // push0
+	buf[ptr] |= 0 << 16                  // push1 (black pixel)
 	ptr++
-	// EOL_ALIGN must be in LOW 16 bits (PIO reads low bits first with shift-right)
-	buf[ptr] = uint32(COMPOSABLE_EOL_ALIGN)
-	ptr++
+	// push32: EOL_ALIGN in HIGH bits, NO ptr++ after
+	buf[ptr] = uint32(COMPOSABLE_EOL_ALIGN) << 16
 
-	return uint16(ptr)
+	return uint16(ptr) // Match C: return ptr, not ptr+1
 }
 
 // buildPaletteBuf builds the palette lookup table
