@@ -650,8 +650,11 @@ func prepareForActiveScanline() {
 	state := interrupt.Disable()
 	// First, discard any old scanlines that are behind what we need
 	// This prevents buffer starvation when render loop falls behind
-	for generatedList != nil && !isScanlineAfter(generatedList.core.ScanlineID, nextScanlineID-1) {
-		// This scanline is old (before or equal to current-1), discard it
+	// Note: We check if nextScanlineID is AFTER the buffer's ID, meaning the buffer is old.
+	// We do NOT use "nextScanlineID-1" because that causes unsigned wraparound when
+	// nextScanlineID=0 at startup, incorrectly discarding ALL buffers including scanline 0.
+	for generatedList != nil && isScanlineAfter(nextScanlineID, generatedList.core.ScanlineID) {
+		// This scanline is old (strictly before what we need), discard it
 		old := generatedList
 		generatedList = generatedList.next
 		if generatedList == nil {
