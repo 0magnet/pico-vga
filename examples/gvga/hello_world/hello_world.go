@@ -68,6 +68,16 @@ func main() {
 	initHelloWorld(&state, width, height)
 	println("State initialized")
 
+	// Pre-fill BOTH frame buffers before starting video to ensure clean initial state
+	// This prevents the render loop from seeing garbage data on startup
+	println("Pre-filling frame buffers...")
+	g.Clear(0)
+	drawHelloWorld(g, &state)
+	// Don't call Swap yet - we need to fill ShowFrame directly
+	// Copy DrawFrame to ShowFrame so both have identical content
+	copy(g.ShowFrame, g.DrawFrame)
+	println("Frame buffers initialized")
+
 	// Start video
 	println("Starting video...")
 	g.Start()
