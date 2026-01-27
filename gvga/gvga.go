@@ -394,10 +394,12 @@ func (g *GVga) renderScanline1BPP_RawRun(buf []uint32, width, scanline int) uint
 	buf[ptr] = uint32(COMPOSABLE_RAW_1P) // push0: low = RAW_1P
 	buf[ptr] |= 0 << 16                  // push1: high = 0 (black)
 	ptr++
-	// push32: high = EOL_ALIGN (low bits are garbage/0, but C code does this)
-	buf[ptr] |= uint32(COMPOSABLE_EOL_ALIGN) << 16
+	// push32: high = EOL_ALIGN (for alignment, but this word is NOT sent - C behavior)
+	// Note: C returns _gvga_bufptr which is ptr at this point, NOT ptr+1
+	// The EOL_ALIGN word is written but not included in DataUsed
+	buf[ptr] = uint32(COMPOSABLE_EOL_ALIGN) << 16
 
-	return uint16(ptr + 1) // Include the final word
+	return uint16(ptr) // Match C: return ptr, not ptr+1
 }
 
 // renderScanline2BPP renders a 2bpp scanline (matches C _scanline_render_2bpp)
