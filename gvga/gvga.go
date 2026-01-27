@@ -328,8 +328,10 @@ func (g *GVga) renderScanline1BPP_ColorRun(buf []uint32, width, scanline int) ui
 }
 
 // renderScanline1BPP_RawRun renders using RAW_RUN (matches C _scanline_render_1bpp exactly)
+// Uses push0/push1/push32 pattern from C code
 func (g *GVga) renderScanline1BPP_RawRun(buf []uint32, width, scanline int) uint16 {
 	ptr := 0
+
 	idx := scanline * width / _8_PIXELS_PER_BYTE
 	row := g.ShowFrame[idx:]
 	cols := width / _8_PIXELS_PER_BYTE
@@ -337,45 +339,65 @@ func (g *GVga) renderScanline1BPP_RawRun(buf []uint32, width, scanline int) uint
 	// First byte - 8 pixels
 	b := row[0]
 	colors := paletteBuf[int(b)*_8_PIXELS_PER_BYTE:]
-	rowIdx := 1
+	ci := 0
 
-	// RAW_RUN header + first 8 pixels
-	buf[ptr] = uint32(COMPOSABLE_RAW_RUN) | (uint32(colors[0]) << 16) // RAW_RUN | p0
+	// push0/push1 pattern matching C exactly
+	buf[ptr] = uint32(COMPOSABLE_RAW_RUN) // push0: low = RAW_RUN
+	buf[ptr] |= uint32(colors[ci]) << 16  // push1: high = p0
+	ci++
 	ptr++
-	buf[ptr] = uint32(width-3) | (uint32(colors[1]) << 16) // count | p1
+
+	buf[ptr] = uint32(width - 3)         // push0: low = count
+	buf[ptr] |= uint32(colors[ci]) << 16 // push1: high = p1
+	ci++
 	ptr++
-	buf[ptr] = uint32(colors[2]) | (uint32(colors[3]) << 16) // p2 | p3
+
+	buf[ptr] = uint32(colors[ci]) // push0: low = p2
+	ci++
+	buf[ptr] |= uint32(colors[ci]) << 16 // push1: high = p3
+	ci++
 	ptr++
-	buf[ptr] = uint32(colors[4]) | (uint32(colors[5]) << 16) // p4 | p5
+
+	buf[ptr] = uint32(colors[ci]) // push0: low = p4
+	ci++
+	buf[ptr] |= uint32(colors[ci]) << 16 // push1: high = p5
+	ci++
 	ptr++
-	buf[ptr] = uint32(colors[6]) | (uint32(colors[7]) << 16) // p6 | p7
+
+	buf[ptr] = uint32(colors[ci]) // push0: low = p6
+	ci++
+	buf[ptr] |= uint32(colors[ci]) << 16 // push1: high = p7
+	ci++
 	ptr++
 	cols--
 
 	// Remaining bytes (8 pixels each)
 	for i := 0; i < cols; i++ {
-		b = row[rowIdx]
-		rowIdx++
+		b = row[i+1]
 		colors = paletteBuf[int(b)*_8_PIXELS_PER_BYTE:]
 
-		buf[ptr] = uint32(colors[0]) | (uint32(colors[1]) << 16)
+		buf[ptr] = uint32(colors[0])
+		buf[ptr] |= uint32(colors[1]) << 16
 		ptr++
-		buf[ptr] = uint32(colors[2]) | (uint32(colors[3]) << 16)
+		buf[ptr] = uint32(colors[2])
+		buf[ptr] |= uint32(colors[3]) << 16
 		ptr++
-		buf[ptr] = uint32(colors[4]) | (uint32(colors[5]) << 16)
+		buf[ptr] = uint32(colors[4])
+		buf[ptr] |= uint32(colors[5]) << 16
 		ptr++
-		buf[ptr] = uint32(colors[6]) | (uint32(colors[7]) << 16)
+		buf[ptr] = uint32(colors[6])
+		buf[ptr] |= uint32(colors[7]) << 16
 		ptr++
 	}
 
-	// End of line - must end with black pixel
-	buf[ptr] = uint32(COMPOSABLE_RAW_1P) | (0 << 16)
+	// End of line - must end with black pixel (matching C exactly)
+	buf[ptr] = uint32(COMPOSABLE_RAW_1P) // push0: low = RAW_1P
+	buf[ptr] |= 0 << 16                  // push1: high = 0 (black)
 	ptr++
-	// EOL_ALIGN must be in LOW 16 bits (PIO reads low bits first with shift-right)
-	buf[ptr] = uint32(COMPOSABLE_EOL_ALIGN)
-	ptr++
+	// push32: high = EOL_ALIGN (low bits are garbage/0, but C code does this)
+	buf[ptr] |= uint32(COMPOSABLE_EOL_ALIGN) << 16
 
-	return uint16(ptr)
+	return uint16(ptr + 1) // Include the final word
 }
 
 // renderScanline2BPP renders a 2bpp scanline (matches C _scanline_render_2bpp)
