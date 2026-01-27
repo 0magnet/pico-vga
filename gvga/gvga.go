@@ -32,6 +32,9 @@ var paletteBuf [256 * 8]uint16
 // Package-level variable for render loop (matches scanvideo_minimal pattern)
 var currentGVga *GVga
 
+// Package-level mode for core1 initialization (matches C pattern)
+var pendingMode *scanvideo.Mode
+
 // Init creates and initializes a GVga context
 func Init(width, height uint16, bits int, doubleBuffer, interlaced bool, userData interface{}) *GVga {
 	g := &GVga{
@@ -128,11 +131,15 @@ func (g *GVga) getVgaMode() *scanvideo.Mode {
 }
 
 // Start begins VGA output using scanvideo
-// Simplified to match scanvideo_minimal exactly
+// Matches working scanvideo_minimal pattern exactly:
+// 1. Setup scanvideo
+// 2. Start render loop goroutine (pre-fills buffers)
+// 3. Brief sleep to allow pre-fill
+// 4. Enable timing
 func (g *GVga) Start() {
 	println("gvga.Start: entering")
 
-	// Use global mode directly like scanvideo_minimal does
+	// Select mode based on width
 	var mode *scanvideo.Mode
 	if g.Width == 320 {
 		mode = &scanvideo.Mode320x240_60
@@ -141,23 +148,28 @@ func (g *GVga) Start() {
 	}
 	println("gvga.Start: width=", g.Width, "using mode width=", mode.Width)
 
+	// Store gvga context for render loop
+	g.running = true
+	currentGVga = g
+
+	// Setup scanvideo (like scanvideo_minimal)
 	if !scanvideo.Setup(mode) {
-		println("gvga: scanvideo setup failed")
+		println("gvga.Start: scanvideo setup failed")
 		return
 	}
 	println("gvga.Start: Setup succeeded")
 
-	// Start render loop BEFORE enabling timing (like scanvideo_minimal)
-	g.running = true
-	currentGVga = g // Store for package-level render function
+	// Start render loop goroutine BEFORE enabling timing
+	// This allows pre-filling scanline buffers (matches scanvideo_minimal)
 	go renderLoopFunc()
+	println("gvga.Start: render loop started")
 
-	// Small delay to let render loop start (like scanvideo_minimal)
+	// Sleep to let render loop pre-fill buffers (matches scanvideo_minimal)
 	time.Sleep(50 * time.Millisecond)
 
-	// Enable video output
+	// Enable timing
 	scanvideo.TimingEnable(true)
-	println("gvga.Start: done")
+	println("gvga.Start: timing enabled")
 }
 
 // Stop stops VGA output
@@ -175,8 +187,6 @@ func renderLoopFunc() {
 		return
 	}
 	println("renderLoopFunc: g.Width=", g.Width, "g.Height=", g.Height, "g.HeaderRows=", g.HeaderRows)
-	isInterlaced := g.Mode&ModeInterlaced != 0
-	oddFrame := false
 
 	for {
 		// Get a scanline buffer (blocks until one is available)
@@ -186,15 +196,7 @@ func renderLoopFunc() {
 		}
 
 		g.RenderCount++
-		frameNumber := scanvideo.FrameNumber(buf.ScanlineID)
 		scanline := scanvideo.ScanlineNumber(buf.ScanlineID)
-		isEvenScanline := (scanline & 1) == 0
-		oddFrame = (frameNumber & 1) != 0
-
-		// Debug first few renders
-		if g.RenderCount <= 5 {
-			println("render:", g.RenderCount, "scanline:", scanline, "frame:", frameNumber)
-		}
 
 		// Render appropriate content based on scanline position
 		if scanline < g.HeaderRows {
@@ -202,13 +204,7 @@ func renderLoopFunc() {
 			buf.DataUsed = g.renderBlankLine(buf.Data, int(g.Width), int(scanline), g.BorderColors[BorderTop])
 		} else if scanline < g.Height+g.HeaderRows {
 			// Active display region
-			if isInterlaced && (oddFrame != isEvenScanline) {
-				// Interlaced: skip alternate lines
-				buf.DataUsed = g.renderBlankLine(buf.Data, int(g.Width), int(scanline), g.Palette[0])
-			} else {
-				// Render actual content from frame buffer
-				buf.DataUsed = g.renderScanline(buf.Data, int(g.Width), int(scanline-g.HeaderRows))
-			}
+			buf.DataUsed = g.renderScanline(buf.Data, int(g.Width), int(scanline-g.HeaderRows))
 		} else {
 			// Bottom border
 			buf.DataUsed = g.renderBlankLine(buf.Data, int(g.Width), int(scanline), g.BorderColors[BorderBottom])
@@ -267,7 +263,7 @@ func (g *GVga) renderLoopInternal() {
 		bgColor := uint32(0x001F) // RED for visibility
 		buf.Data[0] = uint32(scanvideo.COMPOSABLE_COLOR_RUN) | (bgColor << 16)
 		buf.Data[1] = uint32(g.Width-3) | (uint32(scanvideo.COMPOSABLE_RAW_1P) << 16)
-		buf.Data[2] = 0 | (uint32(scanvideo.COMPOSABLE_EOL_ALIGN) << 16)
+		buf.Data[2] = uint32(scanvideo.COMPOSABLE_EOL_ALIGN) // LOW 16 bits for PIO
 		buf.DataUsed = 3
 		buf.Status = scanvideo.ScanlineOK
 
@@ -297,7 +293,7 @@ var TestRawPixels = 8
 
 // UseColorRunFor1BPP enables simpler COLOR_RUN rendering instead of RAW_RUN for debugging
 // Set to false to use RAW_RUN (matching C source _scanline_render_1bpp)
-var UseColorRunFor1BPP = false // Use RAW_RUN to match C source
+var UseColorRunFor1BPP = false // Use RAW_RUN to show actual pixels
 
 // renderScanline1BPP renders a 1bpp scanline
 // When UseColorRunFor1BPP is true, uses simple COLOR_RUN (for debugging)
@@ -325,7 +321,9 @@ func (g *GVga) renderScanline1BPP_ColorRun(buf []uint32, width, scanline int) ui
 	// Simple COLOR_RUN for the whole line
 	buf[0] = uint32(COMPOSABLE_COLOR_RUN) | (uint32(color) << 16)
 	buf[1] = uint32(width-3) | (uint32(COMPOSABLE_RAW_1P) << 16)
-	buf[2] = 0 | (uint32(COMPOSABLE_EOL_ALIGN) << 16)
+	// After RAW_1P outputs black (0), "out pc" reads next 16 bits for jump target
+	// EOL_ALIGN must be in LOW 16 bits (PIO reads low bits first with shift-right)
+	buf[2] = uint32(COMPOSABLE_EOL_ALIGN)
 	return 3
 }
 
@@ -373,7 +371,8 @@ func (g *GVga) renderScanline1BPP_RawRun(buf []uint32, width, scanline int) uint
 	// End of line - must end with black pixel
 	buf[ptr] = uint32(COMPOSABLE_RAW_1P) | (0 << 16)
 	ptr++
-	buf[ptr] = uint32(COMPOSABLE_EOL_ALIGN) << 16
+	// EOL_ALIGN must be in LOW 16 bits (PIO reads low bits first with shift-right)
+	buf[ptr] = uint32(COMPOSABLE_EOL_ALIGN)
 	ptr++
 
 	return uint16(ptr)
@@ -411,7 +410,7 @@ func (g *GVga) renderScanline2BPP(buf []uint32, width, scanline int) uint16 {
 	// End of line
 	buf[ptr] = uint32(COMPOSABLE_RAW_1P) | (0 << 16)
 	ptr++
-	buf[ptr] = uint32(COMPOSABLE_EOL_ALIGN) << 16
+	buf[ptr] = uint32(COMPOSABLE_EOL_ALIGN) // LOW 16 bits for PIO
 	ptr++
 
 	return uint16(ptr)
@@ -445,7 +444,7 @@ func (g *GVga) renderScanline4BPP(buf []uint32, width, scanline int) uint16 {
 	// End of line
 	buf[ptr] = uint32(COMPOSABLE_RAW_1P) | (0 << 16)
 	ptr++
-	buf[ptr] = uint32(COMPOSABLE_EOL_ALIGN) << 16
+	buf[ptr] = uint32(COMPOSABLE_EOL_ALIGN) // LOW 16 bits for PIO
 	ptr++
 
 	return uint16(ptr)
@@ -472,7 +471,7 @@ func (g *GVga) renderScanline8BPP(buf []uint32, width, scanline int) uint16 {
 	// End of line
 	buf[ptr] = uint32(COMPOSABLE_RAW_1P) | (0 << 16)
 	ptr++
-	buf[ptr] = uint32(COMPOSABLE_EOL_ALIGN) << 16
+	buf[ptr] = uint32(COMPOSABLE_EOL_ALIGN) // LOW 16 bits for PIO
 	ptr++
 
 	return uint16(ptr)
@@ -491,8 +490,8 @@ func (g *GVga) renderBlankLine(buf []uint32, width, scanline int, color Color) u
 	ptr++
 	buf[ptr] = uint32(COMPOSABLE_RAW_1P) | (0 << 16)
 	ptr++
-	// Note: must end with a black pixel
-	buf[ptr] = uint32(COMPOSABLE_EOL_ALIGN) << 16
+	// EOL_ALIGN must be in LOW 16 bits (PIO reads low bits first with shift-right)
+	buf[ptr] = uint32(COMPOSABLE_EOL_ALIGN)
 	ptr++
 
 	return uint16(ptr)

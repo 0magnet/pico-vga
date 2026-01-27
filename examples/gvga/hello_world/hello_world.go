@@ -4,6 +4,7 @@ package main
 
 import (
 	"machine"
+	"runtime"
 	"time"
 
 	"github.com/0magnet/pico-vga/gvga"
@@ -73,7 +74,7 @@ func main() {
 	scanlineOff, timingOff := scanvideo.GetProgramOffsets()
 	println("Video started, scanline offset=", scanlineOff, "timing offset=", timingOff)
 
-	// Main loop - matches C version
+	// Main loop - SIMPLIFIED to match scanvideo_minimal exactly
 	loopCount := 0
 	for {
 		loopCount++
@@ -85,12 +86,13 @@ func main() {
 			println("  Hits:", stats.BufferHits, "Miss:", stats.BufferMisses, "Frames:", stats.FramesComplete)
 		}
 
-		// Draw content and animate
-		g.Clear(0) // Clear to background color (palette[0] = White)
+		// Draw content with explicit yields to let render loop run
+		runtime.Gosched() // Yield before drawing
+		g.Clear(0)
+		runtime.Gosched() // Yield after clear
 		drawHelloWorld(g, &state)
+		runtime.Gosched() // Yield after draw
 		moveHelloWorld(&state)
-
-		// Swap buffers (copies DrawFrame to ShowFrame during vblank)
 		g.Swap(true)
 
 		// Check for commands
@@ -221,8 +223,8 @@ func main() {
 			}
 		}
 
-		// Small delay to control animation speed
-		time.Sleep(16 * time.Millisecond) // ~60fps
+		// Small delay - matches scanvideo_minimal
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
