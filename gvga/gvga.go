@@ -216,19 +216,27 @@ func renderLoopFunc() {
 }
 
 // Sync waits for the current frame to finish displaying
+// This matches the C gvga_sync() behavior - it waits for the render loop
+// to complete all content scanlines before returning.
 func (g *GVga) Sync() {
-	scanvideo.WaitForVblank()
+	scanvideo.WaitForFrame()
 }
 
 // Swap swaps draw and show buffers (for double buffering)
+// This matches the C gvga_swap() behavior:
+// - If doCopy is true, copies DrawFrame to ShowFrame before swapping
+// - If doCopy is false, just swaps pointers (proper double buffering)
+// Uses WaitForFrame() to ensure the render loop has finished the current frame.
 func (g *GVga) Swap(doCopy bool) {
 	if g.Mode&ModeDoubleBuffered == 0 {
 		return
 	}
 
-	// Wait for vblank to avoid tearing
-	scanvideo.WaitForVblank()
+	// Wait for current frame to finish (matches C gvga_sync() + gvga_swap() pattern)
+	// This ensures the render loop has finished reading ShowFrame
+	scanvideo.WaitForFrame()
 
+	// Copy and swap
 	if doCopy && g.DrawFrame != nil && g.ShowFrame != nil {
 		copy(g.ShowFrame, g.DrawFrame)
 	}

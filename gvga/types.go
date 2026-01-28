@@ -149,6 +149,13 @@ type GVga struct {
 	frameCount    uint32
 	vgaMode       *scanvideo.Mode
 	RenderCount   uint32 // Public counter for debug
+
+	// Synchronization (matches C mutex pattern)
+	// rendering is true while render loop is actively processing scanlines (0 to Height-1)
+	// Swap waits for this to be false before modifying ShowFrame
+	rendering     bool
+	// swapPending is set by Swap() to tell render loop to wait before starting new frame
+	swapPending   bool
 }
 
 // ScanlineRenderFunc is the function signature for scanline renderers

@@ -924,6 +924,18 @@ func WaitForVblank() {
 	}
 }
 
+// WaitForFrame waits for a complete frame to be displayed
+// This is similar to the C gvga_sync() function - it ensures that
+// all content scanlines for the current frame have been rendered
+// before returning. This is safer than WaitForVblank alone because
+// it guarantees the render loop has finished reading ShowFrame.
+func WaitForFrame() {
+	startFrame := debugCounters.framesComplete.Get()
+	for debugCounters.framesComplete.Get() == startFrame {
+		runtime.Gosched()
+	}
+}
+
 // GetMode returns the current video mode
 func GetMode() Mode {
 	return videoMode

@@ -84,6 +84,12 @@ func main() {
 	scanlineOff, timingOff := scanvideo.GetProgramOffsets()
 	println("Video started, scanline offset=", scanlineOff, "timing offset=", timingOff)
 
+	// Wait for a few frames to ensure pre-filled buffers are consumed
+	// This prevents half-line artifacts from buffer timing at startup
+	g.Sync()
+	g.Sync()
+	println("Startup sync complete")
+
 	// Main loop - SIMPLIFIED to match scanvideo_minimal exactly
 	loopCount := 0
 	for {
@@ -103,7 +109,7 @@ func main() {
 		drawHelloWorld(g, &state)
 		runtime.Gosched() // Yield after draw
 		moveHelloWorld(&state)
-		g.Swap(true)
+		g.Swap(false) // false = no copy, proper double buffering (matches C)
 
 		// Check for commands
 		if machine.Serial.Buffered() > 0 {
