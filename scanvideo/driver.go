@@ -742,7 +742,8 @@ func prepareForActiveScanline() {
 	var data *uint32
 	var count uint16
 
-	if buf != nil && buf.core.ScanlineID == nextScanlineID {
+	wasCorrectScanline := buf != nil && buf.core.ScanlineID == nextScanlineID
+	if wasCorrectScanline {
 		data = &buf.core.Data[0]
 		count = buf.core.DataUsed
 		debugCounters.bufferHits.Set(debugCounters.bufferHits.Get() + 1)
@@ -805,12 +806,18 @@ func prepareForActiveScanline() {
 	yRepeatIndex += videoMode.YScaleDenom
 	if yRepeatIndex >= yRepeatTarget {
 		// Move to next scanline
-		if buf != nil && buf.core.ScanlineID == nextScanlineID {
+		if wasCorrectScanline && buf != nil {
 			// Release the buffer
 			releaseBuffer(buf)
 		}
 		yRepeatIndex -= yRepeatTarget
 		nextScanlineID = scanlineIDAfter(nextScanlineID)
+		currentBuffer = nil
+	} else if !wasCorrectScanline {
+		// Not at end of yscale, but wrong/missing scanline - clear currentBuffer
+		// This matches C scanvideo.c lines 826-828: if we had a miss mid-yscale,
+		// we should try to latch a new buffer on the next repeat instead of
+		// reusing the stale one
 		currentBuffer = nil
 	}
 	interrupt.Restore(state)

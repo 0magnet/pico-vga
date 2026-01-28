@@ -254,6 +254,40 @@ func main() {
 				// Capture first 10 scanlines to see actual pixel data
 				println("Capturing scanlines 0-9...")
 				scanvideo.EnableMultiDMACapture(0)
+				// Wait a bit for capture to complete
+				time.Sleep(100 * time.Millisecond)
+				count, lines, used, data, addrs := scanvideo.GetMultiDMACapture()
+				println("=== SCANLINE CAPTURE (0-9) ===")
+				println("Captured", count, "scanlines")
+				white := uint16(g.Palette[0])
+				red := uint16(g.Palette[1])
+				for i := 0; i < count; i++ {
+					println("--- Scanline", lines[i], "dataUsed=", used[i], "addr=", hexU32(addrs[i]), "---")
+					// Show raw words for detailed analysis
+					println("  Raw words[0-4]:", hexU32(data[i][0]), hexU32(data[i][1]), hexU32(data[i][2]), hexU32(data[i][3]), hexU32(data[i][4]))
+					// Decode command and first pixels
+					cmd := data[i][0] & 0xFFFF
+					if cmd == 7 { // RAW_RUN
+						p0 := (data[i][0] >> 16) & 0xFFFF
+						p1 := (data[i][1] >> 16) & 0xFFFF
+						runLen := data[i][1] & 0xFFFF
+						p2 := data[i][2] & 0xFFFF
+						p3 := (data[i][2] >> 16) & 0xFFFF
+						p4 := data[i][3] & 0xFFFF
+						p5 := (data[i][3] >> 16) & 0xFFFF
+						p6 := data[i][4] & 0xFFFF
+						p7 := (data[i][4] >> 16) & 0xFFFF
+						println("  RAW_RUN: len=", runLen, "pixels 0-7:")
+						println("   ", colorName(uint16(p0), white, red), colorName(uint16(p1), white, red), colorName(uint16(p2), white, red), colorName(uint16(p3), white, red), colorName(uint16(p4), white, red), colorName(uint16(p5), white, red), colorName(uint16(p6), white, red), colorName(uint16(p7), white, red))
+					} else if cmd == 3 { // COLOR_RUN
+						color := (data[i][0] >> 16) & 0xFFFF
+						runLen := data[i][1] & 0xFFFF
+						println("  COLOR_RUN: color=", hexU16(uint16(color)), colorName(uint16(color), white, red), "len=", runLen)
+					} else {
+						println("  Unknown cmd:", cmd)
+					}
+				}
+				println("==============================")
 			} else if b == 'm' {
 				// Capture mid-screen scanlines
 				println("Capturing scanlines 100-109...")
