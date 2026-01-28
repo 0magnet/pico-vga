@@ -11,7 +11,7 @@ import (
 	"github.com/0magnet/pico-vga/scanvideo"
 )
 
-var vgaMode = &scanvideo.Mode320x240_60
+var vgaMode = &scanvideo.Mode640x480_60
 
 func main() {
 	// Initialize serial for debug output and reboot
@@ -86,19 +86,40 @@ func renderLoop() {
 	}
 }
 
-// renderScanline fills a buffer with a solid color based on line number
-// This matches the C scanvideo_minimal example exactly
+// renderScanline fills a buffer with pixel data using RAW_RUN
+// Uses same solid color per line as COLOR_RUN version for fair comparison
 func renderScanline(buffer *scanvideo.ScanlineBuffer) {
 	lineNum := scanvideo.ScanlineNumber(buffer.ScanlineID)
+	width := int(vgaMode.Width)
 
-	// Create color from line number - shifts green/red gradient
-	bgColor := uint16(lineNum << 2)
+	// Create color from line number (same as COLOR_RUN version)
+	color := uint16(lineNum << 2)
 
-	// Fill scanline with single color using COLOR_RUN
-	// Format: [COLOR_RUN | color] [count-3 | RAW_1P] [0 | EOL_ALIGN]
-	buffer.Data[0] = uint32(scanvideo.COMPOSABLE_COLOR_RUN) | (uint32(bgColor) << 16)
-	buffer.Data[1] = uint32(vgaMode.Width-3) | (uint32(scanvideo.COMPOSABLE_RAW_1P) << 16) //nolint
-	buffer.Data[2] = 0 | (uint32(scanvideo.COMPOSABLE_EOL_ALIGN) << 16)
-	buffer.DataUsed = 3
+	ptr := 0
+
+	// RAW_RUN header: command + first pixel
+	buffer.Data[ptr] = uint32(scanvideo.COMPOSABLE_RAW_RUN) | (uint32(color) << 16)
+	ptr++
+
+	// Word 1: count + second pixel
+	// Count = width - 2 (pixel0 and pixel1 are in header, rest in loop)
+	buffer.Data[ptr] = uint32(width-2) | (uint32(color) << 16)
+	ptr++
+
+	// Remaining pixels in pairs (all same color)
+	colorPair := uint32(color) | (uint32(color) << 16)
+	for i := 2; i < width; i += 2 {
+		buffer.Data[ptr] = colorPair
+		ptr++
+	}
+
+	// End of line: RAW_1P + black pixel
+	buffer.Data[ptr] = uint32(scanvideo.COMPOSABLE_RAW_1P) | (0 << 16)
+	ptr++
+	// EOL_ALIGN in high bits (matching C gvga pattern)
+	// Low bits = 0 works because offset 0 flows to offset 1
+	buffer.Data[ptr] = uint32(scanvideo.COMPOSABLE_EOL_ALIGN) << 16
+
+	buffer.DataUsed = uint16(ptr)
 	buffer.Status = scanvideo.ScanlineOK
 }
