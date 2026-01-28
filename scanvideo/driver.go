@@ -510,6 +510,13 @@ func TimingEnable(enable bool) {
 	timingSM.SetEnabled(false)
 	scanlineSM.SetEnabled(false)
 
+	// Restart clock dividers for both SMs to synchronize them
+	// CLKDIV_RESTART bits are at [11:8] of CTRL register
+	// SM mask: (1 << ScanlineSM) | (1 << TimingSM) = (1 << 0) | (1 << 3) = 0x09
+	const clkdivRestartLSB = 8
+	smMask := uint32((1 << ScanlineSM) | (1 << TimingSM))
+	rp.PIO0.CTRL.SetBits(smMask << clkdivRestartLSB)
+
 	if enable {
 		// Initialize interrupts on first enable
 		initInterrupts()
