@@ -104,8 +104,9 @@ func BuildScanlineProgram(xscale uint8) []uint16 {
 		asm.Out(pio.OutDestPC, 16).Encode(), // 2: 0x60b0
 
 		// 3-6: color_run - output single color for count pixels
-		asm.Out(pio.OutDestPins, 16).Delay(extra0).Encode(), // 3: delay_h_0 - output color with delay0
-		asm.Out(pio.OutDestX, 16).Encode(),                  // 4: 0x6030 - load count
+		// NOTE: First out pins has NO delay (matches C exactly)
+		asm.Out(pio.OutDestPins, 16).Encode(),               // 3: color_run - output color (no delay!)
+		asm.Out(pio.OutDestX, 16).Encode(),                  // 4: load count
 		asm.Jmp(pio.JmpXNZeroDec, 5).Delay(extra1).Encode(), // 5: color_loop
 		asm.Out(pio.OutDestPC, 16).Delay(extra1).Encode(),   // 6: next command
 

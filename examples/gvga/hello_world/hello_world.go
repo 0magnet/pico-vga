@@ -27,6 +27,8 @@ type helloWorldState struct {
 }
 
 var state helloWorldState
+var freezeAnimation = false
+var freezeDrawing = false // When true, skip Clear/Draw/Swap entirely
 
 func main() {
 	// Initialize serial first
@@ -111,7 +113,9 @@ func main() {
 		runtime.Gosched() // Yield after clear
 		drawHelloWorld(g, &state)
 		runtime.Gosched() // Yield after draw
-		moveHelloWorld(&state)
+		if !freezeAnimation {
+			moveHelloWorld(&state)
+		}
 		g.Swap(false) // false = no copy, proper double buffering (matches C)
 
 		// Check for commands
@@ -121,6 +125,13 @@ func main() {
 				println("Rebooting...")
 				time.Sleep(100 * time.Millisecond)
 				machine.EnterBootloader()
+			} else if b == 'f' {
+				freezeAnimation = !freezeAnimation
+				if freezeAnimation {
+					println("Animation FROZEN - press 'f' to resume")
+				} else {
+					println("Animation RESUMED")
+				}
 			} else if b == 'd' {
 				// Comprehensive debug dump with pixel verification
 				println("=== PIXEL VERIFICATION ===")

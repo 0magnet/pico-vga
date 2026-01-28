@@ -730,12 +730,8 @@ func prepareForActiveScanline() {
 			buf.next = inUseList
 			inUseList = buf
 			currentBuffer = buf
-			// IMPORTANT: Reset yRepeatIndex when latching a NEW buffer
-			// This ensures the logical scanline gets the full Y-repeat cycle
-			// even if we missed the first physical line(s) due to render lag.
-			// Without this, missed scanlines only display for partial Y-repeat,
-			// causing "half-line" vertical offset artifacts.
-			yRepeatIndex = 0
+			// NOTE: Removed yRepeatIndex reset - it was causing double-image
+			// artifacts by making some scanlines display extra times.
 		}
 	} else {
 		buf = currentBuffer
