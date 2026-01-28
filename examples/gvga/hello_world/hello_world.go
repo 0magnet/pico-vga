@@ -41,7 +41,7 @@ func main() {
 	led.Configure(machine.PinConfig{Mode: machine.PinOutput})
 	println("LED configured")
 
-	// Use 320x240 for now (working mode), with double buffering
+	// Use 320x240 (working mode with Y-scaling), with double buffering
 	width := 320
 	height := 240
 	bits := 1
@@ -104,7 +104,7 @@ func main() {
 			println("  IRQ0:", stats.IRQ0Count, "IRQ1:", stats.IRQ1Count, "DMA:", stats.DMAStarts)
 			println("  Hits:", stats.BufferHits, "Miss:", stats.BufferMisses, "Frames:", stats.FramesComplete)
 			println("  Bufs: free=", bufs.Free, "gen=", bufs.Generated, "use=", bufs.InUse, "cur=", bufs.Current)
-			println("  YRepeat:", bufs.YRepeat, "/", bufs.YTarget)
+			println("  YRepeat:", bufs.YRepeat, "/", bufs.YTarget, "Aborts:", bufs.DmaAborts)
 		}
 
 		// Draw content with explicit yields to let render loop run
@@ -324,6 +324,67 @@ func main() {
 					}
 				}
 				println("========================")
+			} else if b == 'x' {
+				// Compare same scanline captured multiple times to detect jitter
+				println("=== SCANLINE CONSISTENCY CHECK ===")
+				println("Capturing scanline 0 multiple times...")
+
+				// Capture 5 frames worth of scanline 0 data
+				var captures [5][20]uint32
+				var captureAddrs [5]uint32
+				var captureCount int
+
+				for frame := 0; frame < 5; frame++ {
+					scanvideo.EnableMultiDMACapture(0)
+					time.Sleep(50 * time.Millisecond)
+					count, _, _, data, addrs := scanvideo.GetMultiDMACapture()
+					if count > 0 {
+						captureAddrs[captureCount] = addrs[0]
+						for i := 0; i < 20; i++ {
+							captures[captureCount][i] = data[0][i]
+						}
+						captureCount++
+					}
+				}
+
+				println("Captured", captureCount, "instances of scanline 0")
+
+				// Compare first 10 words of each capture
+				println("First 5 words from each capture (with addresses):")
+				for i := 0; i < captureCount; i++ {
+					println("  Capture", i, "addr", hexU32(captureAddrs[i]), ":", hexU32(captures[i][0]), hexU32(captures[i][1]), hexU32(captures[i][2]), hexU32(captures[i][3]), hexU32(captures[i][4]))
+				}
+
+				// Check for differences
+				differences := 0
+				for i := 1; i < captureCount; i++ {
+					for j := 0; j < 10; j++ {
+						if captures[i][j] != captures[0][j] {
+							differences++
+							println("  DIFFERENCE at capture", i, "word", j, ":", hexU32(captures[0][j]), "vs", hexU32(captures[i][j]))
+						}
+					}
+				}
+				if differences == 0 {
+					println("All captures IDENTICAL - jitter not in scanline data")
+				} else {
+					println("Found", differences, "differences - scanline data varies!")
+				}
+				println("==================================")
+			} else if b == 'y' {
+				// Show Y-repeat details for first few scanlines
+				println("=== Y-REPEAT TIMING CHECK ===")
+				println("Capturing with Y-repeat info...")
+				scanvideo.EnableMultiDMACapture(0)
+				time.Sleep(100 * time.Millisecond)
+				count, lines, _, _, addrs := scanvideo.GetMultiDMACapture()
+				println("Captured", count, "physical scanlines:")
+				for i := 0; i < count; i++ {
+					println("  Physical", i, ": logical scanline", lines[i], "addr", hexU32(addrs[i]))
+				}
+				// With Y-scale=2, should see each logical scanline twice
+				println("Expected: each logical scanline appears twice (Y-scale=2)")
+				println("=============================")
 			}
 		}
 

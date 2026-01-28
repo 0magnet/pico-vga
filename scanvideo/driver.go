@@ -66,6 +66,10 @@ var (
 	yRepeatIndex   uint16
 	yRepeatTarget  uint16
 
+	// DMA state tracking (matches C scanvideo.c shared_state.dma)
+	dmaInProgress    uint32 // 1 if DMA transfer is in progress
+	buffersToRelease uint32 // count of buffers pending release
+
 	// Missing scanline data (blue line shown when buffer not ready)
 	missingData [4]uint32
 
@@ -92,6 +96,7 @@ var debugCounters struct {
 	framesComplete  volatile.Register32 // Frames completed
 	lastDataUsed    volatile.Register32 // DataUsed from last buffer
 	lastScanlineNum volatile.Register32 // Last scanline number processed
+	dmaAborts       volatile.Register32 // DMA aborts performed
 }
 
 // DMA buffer capture for verifying actual PIO output
@@ -181,9 +186,10 @@ type BufferCounts struct {
 	Free      int
 	Generated int
 	InUse     int
-	Current   bool // true if currentBuffer is set
+	Current   bool   // true if currentBuffer is set
 	YRepeat   uint16 // current yRepeatIndex
 	YTarget   uint16 // current yRepeatTarget
+	DmaAborts uint32 // count of DMA aborts
 }
 
 // GetBufferCounts returns the number of buffers in each list
@@ -203,6 +209,7 @@ func GetBufferCounts() BufferCounts {
 	counts.Current = currentBuffer != nil
 	counts.YRepeat = yRepeatIndex
 	counts.YTarget = yRepeatTarget
+	counts.DmaAborts = debugCounters.dmaAborts.Get()
 	interrupt.Restore(state)
 	return counts
 }
@@ -259,6 +266,49 @@ type dmaChannelHW struct {
 func getDMAChannel(ch int) *dmaChannelHW {
 	base := uintptr(0x50000000) + uintptr(ch)*0x40
 	return (*dmaChannelHW)(unsafe.Pointer(base))
+}
+
+// DMA CHAN_ABORT register - writing a bit mask aborts those channels
+var dmaAbortReg = (*volatile.Register32)(unsafe.Pointer(uintptr(0x50000444)))
+
+// abortDMAChannel aborts the DMA channel and waits for it to complete
+// This matches C scanvideo.c abort_all_dma_channels_assuming_no_irq_preemption
+//go:nosplit
+func abortDMAChannel(ch int) {
+	// Write channel bit to ABORT register
+	dmaAbortReg.Set(1 << ch)
+
+	// Wait for channel to no longer be busy
+	// On RP2040, we check CTRL_TRIG.BUSY bit (bit 24)
+	dma := getDMAChannel(ch)
+	for dma.CtrlTrig.Get()&(1<<24) != 0 {
+		// tight loop
+	}
+}
+
+// updateDMATransferState checks if previous DMA completed and aborts if needed
+// This matches C scanvideo.c update_dma_transfer_state_irqs_enabled (NO_DMA_TRACKING path)
+// The NO_DMA_TRACKING path only aborts when buffers_to_release is set
+//go:nosplit
+func updateDMATransferState(cancelIfNotComplete bool) int {
+	if dmaInProgress == 0 {
+		// No transfer in progress
+		return 0
+	}
+
+	// Match C scanvideo.c NO_DMA_TRACKING path (lines 652-661):
+	// Only abort if there are buffers to release
+	if buffersToRelease > 0 {
+		toRelease := int(buffersToRelease)
+		buffersToRelease = 0
+		dmaInProgress = 0
+		// Abort the DMA channel
+		abortDMAChannel(ScanlineDMAChannel)
+		debugCounters.dmaAborts.Set(debugCounters.dmaAborts.Get() + 1)
+		return toRelease
+	}
+
+	return 0
 }
 
 // Setup initializes the video system with the given mode
@@ -705,6 +755,10 @@ const PIO_WAIT_IRQ4 = 0x20c4
 // Uses interrupt.Disable/Restore like C's spin_lock_blocking
 //go:nosplit
 func prepareForActiveScanline() {
+	// Note: C code calls update_dma_transfer_state_irqs_enabled here, but the
+	// NO_DMA_TRACKING path causes too many aborts. The video recovery in
+	// recoverScanlineSM() handles stale FIFO data instead.
+
 	// Try to latch a buffer for this scanline
 	var buf *scanlineBufferInternal
 
@@ -806,7 +860,7 @@ func prepareForActiveScanline() {
 	dma.TransCount.Set(uint32(count))
 	dma.CtrlTrig.SetBits(1) // Enable
 
-	// Update scanline tracking
+	// Update scanline tracking (matches C scanvideo.c lines 811-859)
 	state = interrupt.Disable()
 	timingState.inVblank = false
 
