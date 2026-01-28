@@ -96,22 +96,45 @@ var debugCounters struct {
 
 // DMA buffer capture for verifying actual PIO output
 var dmaCapture struct {
-	enabled   bool
-	captured  bool
-	scanline  uint16
-	dataUsed  uint16
-	words     [20]uint32 // First 20 words sent to DMA/PIO
+	enabled      bool
+	captured     bool
+	scanline     uint16
+	dataUsed     uint16
+	words        [20]uint32 // First 20 words sent to DMA/PIO
+	targetLine   uint16     // Which scanline to capture (0 = any)
+	multiCapture bool       // If true, capture multiple consecutive scanlines
+	linesCaptured int       // Number of lines captured in multi mode
+	multiData    [10][20]uint32 // Data for up to 10 scanlines
+	multiLines   [10]uint16     // Scanline numbers
+	multiUsed    [10]uint16     // DataUsed for each
+	multiAddr    [10]uint32     // DMA read addresses for verification
 }
 
 // EnableDMACapture enables capture of next scanline 0 DMA buffer
 func EnableDMACapture() {
 	dmaCapture.enabled = true
 	dmaCapture.captured = false
+	dmaCapture.targetLine = 0
+	dmaCapture.multiCapture = false
+}
+
+// EnableMultiDMACapture enables capture of first N scanlines starting from startLine
+func EnableMultiDMACapture(startLine uint16) {
+	dmaCapture.enabled = true
+	dmaCapture.captured = false
+	dmaCapture.targetLine = startLine
+	dmaCapture.multiCapture = true
+	dmaCapture.linesCaptured = 0
 }
 
 // GetDMACapture returns the captured DMA buffer data
 func GetDMACapture() (captured bool, scanline, dataUsed uint16, words [20]uint32) {
 	return dmaCapture.captured, dmaCapture.scanline, dmaCapture.dataUsed, dmaCapture.words
+}
+
+// GetMultiDMACapture returns captured data for multiple scanlines
+func GetMultiDMACapture() (count int, lines [10]uint16, used [10]uint16, data [10][20]uint32, addrs [10]uint32) {
+	return dmaCapture.linesCaptured, dmaCapture.multiLines, dmaCapture.multiUsed, dmaCapture.multiData, dmaCapture.multiAddr
 }
 
 // DebugStats returns current debug counters for diagnosis
@@ -151,6 +174,37 @@ func ResetDebugStats() {
 	debugCounters.bufferHits.Set(0)
 	debugCounters.bufferMisses.Set(0)
 	debugCounters.framesComplete.Set(0)
+}
+
+// BufferCounts contains counts of buffers in each list for debugging
+type BufferCounts struct {
+	Free      int
+	Generated int
+	InUse     int
+	Current   bool // true if currentBuffer is set
+	YRepeat   uint16 // current yRepeatIndex
+	YTarget   uint16 // current yRepeatTarget
+}
+
+// GetBufferCounts returns the number of buffers in each list
+// This helps diagnose buffer leaks or deadlocks
+func GetBufferCounts() BufferCounts {
+	state := interrupt.Disable()
+	counts := BufferCounts{}
+	for p := freeList; p != nil; p = p.next {
+		counts.Free++
+	}
+	for p := generatedList; p != nil; p = p.next {
+		counts.Generated++
+	}
+	for p := inUseList; p != nil; p = p.next {
+		counts.InUse++
+	}
+	counts.Current = currentBuffer != nil
+	counts.YRepeat = yRepeatIndex
+	counts.YTarget = yRepeatTarget
+	interrupt.Restore(state)
+	return counts
 }
 
 // PIOStatus contains debug info about PIO state
@@ -708,15 +762,34 @@ func prepareForActiveScanline() {
 	debugCounters.lastScanlineNum.Set(uint32(scanlineNum))
 	debugCounters.dmaStarts.Set(debugCounters.dmaStarts.Get() + 1)
 
-	// Capture DMA buffer for debugging (scanline 0 only)
-	if dmaCapture.enabled && !dmaCapture.captured && scanlineNum == 0 && buf != nil {
-		dmaCapture.scanline = scanlineNum
-		dmaCapture.dataUsed = count
-		for i := 0; i < 20 && i < int(count); i++ {
-			dmaCapture.words[i] = buf.core.Data[i]
+	// Capture DMA buffer for debugging
+	if dmaCapture.enabled && buf != nil {
+		if dmaCapture.multiCapture {
+			// Multi-line capture mode: capture consecutive scanlines starting from targetLine
+			if scanlineNum >= dmaCapture.targetLine && dmaCapture.linesCaptured < 10 {
+				idx := dmaCapture.linesCaptured
+				dmaCapture.multiLines[idx] = scanlineNum
+				dmaCapture.multiUsed[idx] = count
+				dmaCapture.multiAddr[idx] = uint32(uintptr(unsafe.Pointer(data))) // Capture DMA address
+				for i := 0; i < 20 && i < int(count); i++ {
+					dmaCapture.multiData[idx][i] = buf.core.Data[i]
+				}
+				dmaCapture.linesCaptured++
+				if dmaCapture.linesCaptured >= 10 {
+					dmaCapture.captured = true
+					dmaCapture.enabled = false
+				}
+			}
+		} else if !dmaCapture.captured && scanlineNum == dmaCapture.targetLine {
+			// Single line capture mode
+			dmaCapture.scanline = scanlineNum
+			dmaCapture.dataUsed = count
+			for i := 0; i < 20 && i < int(count); i++ {
+				dmaCapture.words[i] = buf.core.Data[i]
+			}
+			dmaCapture.captured = true
+			dmaCapture.enabled = false
 		}
-		dmaCapture.captured = true
-		dmaCapture.enabled = false
 	}
 
 	// VIDEO RECOVERY: Clear FIFO and reset SM if needed (matches C scanvideo.c lines 740-765)
@@ -830,6 +903,40 @@ func releaseBuffer(buf *scanlineBufferInternal) {
 	// Add to free list
 	buf.next = freeList
 	freeList = buf
+}
+
+// FlushGeneratedBuffers moves all pre-generated scanline buffers back to the free list.
+// This should be called during buffer swaps to ensure fresh content is rendered.
+// Without this, pre-generated buffers may contain stale framebuffer content from
+// before the swap, causing visual artifacts like "vibrating" text.
+func FlushGeneratedBuffers() {
+	state := interrupt.Disable()
+	// Move all generated buffers back to free list
+	for generatedList != nil {
+		buf := generatedList
+		generatedList = buf.next
+		buf.next = freeList
+		freeList = buf
+	}
+	generatedTail = nil
+	// Set lastScanlineID to just before nextScanlineID so render loop
+	// generates the correct next scanline.
+	// For scanlineID format: high 16 bits = frame, low 16 bits = scanline
+	scanline := nextScanlineID & 0xFFFF
+	frame := nextScanlineID >> 16
+	if scanline > 0 {
+		// Same frame, previous scanline
+		lastScanlineID = (frame << 16) | (scanline - 1)
+	} else {
+		// Scanline 0 - previous is last scanline of previous frame
+		if frame > 0 {
+			lastScanlineID = ((frame - 1) << 16) | uint32(videoMode.Height-1)
+		} else {
+			// Frame 0, scanline 0 - use a very old ID
+			lastScanlineID = 0xFFFF0000 | uint32(videoMode.Height-1)
+		}
+	}
+	interrupt.Restore(state)
 }
 
 // scanlineIDAfter returns the next scanline ID
