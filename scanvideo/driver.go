@@ -70,6 +70,9 @@ var (
 	dmaInProgress    uint32 // 1 if DMA transfer is in progress
 	buffersToRelease uint32 // count of buffers pending release
 
+	// Pending release buffer - released at START of next scanline after DMA completes
+	pendingReleaseBuffer *scanlineBufferInternal
+
 	// Missing scanline data (blue line shown when buffer not ready)
 	missingData [4]uint32
 
@@ -755,9 +758,15 @@ const PIO_WAIT_IRQ4 = 0x20c4
 // Uses interrupt.Disable/Restore like C's spin_lock_blocking
 //go:nosplit
 func prepareForActiveScanline() {
-	// Note: C code calls update_dma_transfer_state_irqs_enabled here, but the
-	// NO_DMA_TRACKING path causes too many aborts. The video recovery in
-	// recoverScanlineSM() handles stale FIFO data instead.
+	// Release any buffer that was pending from the previous scanline
+	// This ensures DMA has finished reading from it before we release
+	// (matches C scanvideo.c deferred release pattern)
+	if pendingReleaseBuffer != nil {
+		state := interrupt.Disable()
+		releaseBuffer(pendingReleaseBuffer)
+		pendingReleaseBuffer = nil
+		interrupt.Restore(state)
+	}
 
 	// Try to latch a buffer for this scanline
 	var buf *scanlineBufferInternal
@@ -868,8 +877,9 @@ func prepareForActiveScanline() {
 	if yRepeatIndex >= yRepeatTarget {
 		// Move to next scanline
 		if wasCorrectScanline && buf != nil {
-			// Release the buffer
-			releaseBuffer(buf)
+			// Don't release immediately - DMA is still reading from this buffer!
+			// Mark for release at the START of the next scanline
+			pendingReleaseBuffer = buf
 		}
 		yRepeatIndex -= yRepeatTarget
 		nextScanlineID = scanlineIDAfter(nextScanlineID)
