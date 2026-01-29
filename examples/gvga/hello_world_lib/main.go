@@ -32,9 +32,8 @@ func main() {
 	led.Configure(machine.PinConfig{Mode: machine.PinOutput})
 	led.High()
 
-	// Initialize gvga: 320x240, 1bpp, double buffered, not interlaced
-	// Testing with 320x240 to match working scanvideo minimal
-	g := gvga.Init(320, 240, 1, true, false, nil)
+	// Initialize gvga: 640x480, 1bpp, double buffered, not interlaced
+	g := gvga.Init(640, 480, 1, true, false, nil)
 	if g == nil {
 		println("gvga init failed!")
 		blinkError(led)
@@ -84,11 +83,11 @@ func main() {
 		anim.x += anim.dx
 		anim.y += anim.dy
 
-		// Bounds check - adjusted for 320x240 test mode
-		if anim.x > 320-120 || anim.x < 20 {
+		// Bounds check for 640x480
+		if anim.x > 640-120 || anim.x < 20 {
 			anim.dx = -anim.dx
 		}
-		if anim.y > 240-70 || anim.y < 20 {
+		if anim.y > 480-70 || anim.y < 20 {
 			anim.dy = -anim.dy
 		}
 
@@ -101,10 +100,10 @@ func main() {
 }
 
 func drawPattern(g *gvga.GVga) {
-	// Border - adjusted for 320x240 test mode
+	// Border for 640x480
 	for i := 1; i < 16; i++ {
 		color := uint16(i % 2) // Alternates 1, 0, 1, 0, ...
-		g.Box(i-1, i-1, 320-i, 240-i, color)
+		g.Box(i-1, i-1, 640-i, 480-i, color)
 	}
 
 	// Draw "HELLO" text (matches C example)

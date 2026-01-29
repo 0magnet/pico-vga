@@ -297,53 +297,13 @@ func (g *GVga) renderScanline(buf []uint32, width, scanline int) uint16 {
 	}
 }
 
-// Test configuration for RAW_RUN pixel count (must be multiple of 8)
-var TestRawPixels = 8
-
-// UseColorRunFor1BPP enables simpler COLOR_RUN rendering instead of RAW_RUN for debugging
-// Set to false to use RAW_RUN (matching C source _scanline_render_1bpp)
-var UseColorRunFor1BPP = false // Use RAW_RUN to show actual pixels
-
-// renderScanline1BPP renders a 1bpp scanline
-// When UseColorRunFor1BPP is true, uses simple COLOR_RUN (for debugging)
-// When false, uses RAW_RUN matching C _scanline_render_1bpp exactly
+// renderScanline1BPP renders a 1bpp scanline (matches C _scanline_render_1bpp exactly)
 func (g *GVga) renderScanline1BPP(buf []uint32, width, scanline int) uint16 {
-	if UseColorRunFor1BPP {
-		return g.renderScanline1BPP_ColorRun(buf, width, scanline)
-	}
-	return g.renderScanline1BPP_RawRun(buf, width, scanline)
-}
-
-// renderScanline1BPP_ColorRun uses simple COLOR_RUN for solid lines
-// This is simpler and more reliable for debugging
-func (g *GVga) renderScanline1BPP_ColorRun(buf []uint32, width, scanline int) uint16 {
-	idx := scanline * width / _8_PIXELS_PER_BYTE
-
-	// Check first byte to determine dominant color
-	var color uint16
-	if g.ShowFrame[idx] == 0xFF {
-		color = uint16(g.Palette[1]) // All 1s = color 1
-	} else {
-		color = uint16(g.Palette[0]) // All 0s = color 0
-	}
-
-	// Simple COLOR_RUN for the whole line
-	buf[0] = uint32(COMPOSABLE_COLOR_RUN) | (uint32(color) << 16)
-	buf[1] = uint32(width-3) | (uint32(COMPOSABLE_RAW_1P) << 16)
-	// After RAW_1P outputs black (0), "out pc" reads next 16 bits for jump target
-	// EOL_ALIGN must be in LOW 16 bits (PIO reads low bits first with shift-right)
-	buf[2] = uint32(COMPOSABLE_EOL_ALIGN)
-	return 3
-}
-
-// renderScanline1BPP_RawRun renders using RAW_RUN (matches C _scanline_render_1bpp exactly)
-// Uses push0/push1/push32 pattern from C code
-func (g *GVga) renderScanline1BPP_RawRun(buf []uint32, width, scanline int) uint16 {
 	ptr := 0
+	cols := width / _8_PIXELS_PER_BYTE
 
 	idx := scanline * width / _8_PIXELS_PER_BYTE
 	row := g.ShowFrame[idx:]
-	cols := width / _8_PIXELS_PER_BYTE
 
 	// First byte - 8 pixels
 	b := row[0]
@@ -356,7 +316,7 @@ func (g *GVga) renderScanline1BPP_RawRun(buf []uint32, width, scanline int) uint
 	ci++
 	ptr++
 
-	buf[ptr] = uint32(width - 3)         // push0: low = count
+	buf[ptr] = uint32(width - 3)         // push0: low = count (width-3 matches C _scanline_render_1bpp)
 	buf[ptr] |= uint32(colors[ci]) << 16 // push1: high = p1
 	ci++
 	ptr++

@@ -14,8 +14,8 @@ import (
 
 // Configuration constants
 const (
-	ScanlineBufferCount    = 16  // Number of scanline buffers (increased for 640x480)
-	MaxScanlineBufferWords = 330 // Max words per scanline buffer (enough for 640 pixels at 1BPP with RAW_RUN)
+	ScanlineBufferCount    = 32  // Number of scanline buffers (increased for 640x480)
+	MaxScanlineBufferWords = 400 // Max words per scanline buffer (increased for safety at 640x480)
 
 	// State machine assignments
 	ScanlineSM = 0 // SM0 for scanline output
