@@ -178,6 +178,9 @@ func (g *GVga) Stop() {
 	scanvideo.TimingEnable(false)
 }
 
+// TestSimpleRender enables simple COLOR_RUN rendering for debugging 640x480
+var TestSimpleRender = false
+
 // renderLoopFunc is package-level render loop (matches C render_loop in gvga.c)
 func renderLoopFunc() {
 	println("renderLoopFunc: starting")
@@ -198,16 +201,25 @@ func renderLoopFunc() {
 		g.RenderCount++
 		scanline := scanvideo.ScanlineNumber(buf.ScanlineID)
 
-		// Render appropriate content based on scanline position
-		if scanline < g.HeaderRows {
-			// Top border
-			buf.DataUsed = g.renderBlankLine(buf.Data, int(g.Width), int(scanline), g.BorderColors[BorderTop])
-		} else if scanline < g.Height+g.HeaderRows {
-			// Active display region
-			buf.DataUsed = g.renderScanline(buf.Data, int(g.Width), int(scanline-g.HeaderRows))
+		if TestSimpleRender {
+			// Simple COLOR_RUN rendering for debugging (matches C scanvideo_minimal)
+			color := uint16(scanline << 2)
+			buf.Data[0] = uint32(COMPOSABLE_COLOR_RUN) | (uint32(color) << 16)
+			buf.Data[1] = uint32(g.Width-3) | (uint32(COMPOSABLE_RAW_1P) << 16)
+			buf.Data[2] = 0 | (uint32(COMPOSABLE_EOL_ALIGN) << 16) // 0 (black) in low, EOL_ALIGN in high
+			buf.DataUsed = 3
 		} else {
-			// Bottom border
-			buf.DataUsed = g.renderBlankLine(buf.Data, int(g.Width), int(scanline), g.BorderColors[BorderBottom])
+			// Render appropriate content based on scanline position
+			if scanline < g.HeaderRows {
+				// Top border
+				buf.DataUsed = g.renderBlankLine(buf.Data, int(g.Width), int(scanline), g.BorderColors[BorderTop])
+			} else if scanline < g.Height+g.HeaderRows {
+				// Active display region
+				buf.DataUsed = g.renderScanline(buf.Data, int(g.Width), int(scanline-g.HeaderRows))
+			} else {
+				// Bottom border
+				buf.DataUsed = g.renderBlankLine(buf.Data, int(g.Width), int(scanline), g.BorderColors[BorderBottom])
+			}
 		}
 
 		buf.Status = scanvideo.ScanlineOK
@@ -314,8 +326,8 @@ func (g *GVga) renderScanline1BPP(buf []uint32, width, scanline int) uint16 {
 	return g.renderScanline1BPP_RawRun(buf, width, scanline)
 }
 
-// renderScanline1BPP_ColorRun uses simple COLOR_RUN for solid lines
-// This is simpler and more reliable for debugging
+// renderScanline1BPP_ColorRun uses COLOR_RUN format matching C _scanline_render_blank_line exactly
+// This is simpler than RAW_RUN for solid colored lines
 func (g *GVga) renderScanline1BPP_ColorRun(buf []uint32, width, scanline int) uint16 {
 	idx := scanline * width / _8_PIXELS_PER_BYTE
 
@@ -327,20 +339,223 @@ func (g *GVga) renderScanline1BPP_ColorRun(buf []uint32, width, scanline int) ui
 		color = uint16(g.Palette[0]) // All 0s = color 0
 	}
 
-	// Simple COLOR_RUN for the whole line
-	buf[0] = uint32(COMPOSABLE_COLOR_RUN) | (uint32(color) << 16)
-	buf[1] = uint32(width-3) | (uint32(COMPOSABLE_RAW_1P) << 16)
-	// After RAW_1P outputs black (0), "out pc" reads next 16 bits for jump target
-	// EOL_ALIGN must be in LOW 16 bits (PIO reads low bits first with shift-right)
-	buf[2] = uint32(COMPOSABLE_EOL_ALIGN)
-	return 3
+	ptr := 0
+	// COLOR_RUN format matching C _scanline_render_blank_line exactly
+	buf[ptr] = uint32(COMPOSABLE_COLOR_RUN) // push0
+	buf[ptr] |= uint32(color) << 16         // push1
+	ptr++
+	buf[ptr] = uint32(width - 5)               // push0 (COLOR_RUN uses width-5)
+	buf[ptr] |= uint32(COMPOSABLE_RAW_2P) << 16 // push1
+	ptr++
+	buf[ptr] = uint32(color)         // push0
+	buf[ptr] |= uint32(color) << 16  // push1
+	ptr++
+	buf[ptr] = uint32(COMPOSABLE_RAW_1P) // push0
+	buf[ptr] |= 0 << 16                  // push1 (black pixel)
+	ptr++
+	buf[ptr] = uint32(COMPOSABLE_EOL_ALIGN) << 16 // push32 (HIGH bits)
+	return uint16(ptr)
 }
+
+// TestRawRunSimple uses simple solid color RAW_RUN (like scanvideo/minimal) for debugging
+var TestRawRunSimple = false
+
+// TestPaletteOnly uses palette colors but not framebuffer (to isolate palette vs framebuffer issues)
+var TestPaletteOnly = false
+
+// TestPaletteBuf tests the paletteBuf lookup table
+var TestPaletteBuf = false
+
+// TestFramebuffer tests reading from the actual framebuffer
+var TestFramebuffer = false
+
+// TestPartialFramebuffer - render first 8 bytes from framebuffer, rest solid color
+var TestPartialFramebuffer = false
 
 // renderScanline1BPP_RawRun renders using RAW_RUN (matches C _scanline_render_1bpp exactly)
 // Uses push0/push1/push32 pattern from C code
 func (g *GVga) renderScanline1BPP_RawRun(buf []uint32, width, scanline int) uint16 {
 	ptr := 0
 
+	// TEST: Use simple solid color pattern identical to working scanvideo/minimal
+	if TestRawRunSimple {
+		color := uint16(scanline << 2)
+
+		// RAW_RUN header: command + first pixel
+		buf[ptr] = uint32(COMPOSABLE_RAW_RUN) | (uint32(color) << 16)
+		ptr++
+
+		// Count + second pixel (matches scanvideo/minimal exactly)
+		buf[ptr] = uint32(width-2) | (uint32(color) << 16)
+		ptr++
+
+		// Remaining pixels in pairs (all same color)
+		colorPair := uint32(color) | (uint32(color) << 16)
+		for i := 2; i < width; i += 2 {
+			buf[ptr] = colorPair
+			ptr++
+		}
+
+		// End of line: RAW_1P + black pixel
+		buf[ptr] = uint32(COMPOSABLE_RAW_1P) | (0 << 16)
+		ptr++
+		// EOL_ALIGN in high bits (matching scanvideo/minimal)
+		buf[ptr] = uint32(COMPOSABLE_EOL_ALIGN) << 16
+
+		return uint16(ptr)
+	}
+
+	// TEST: Use palette colors directly (alternating) to test paletteBuf
+	if TestPaletteOnly {
+		// Use palette[0] and palette[1] in alternating pattern
+		color0 := uint16(g.Palette[0])
+		color1 := uint16(g.Palette[1])
+		// Alternate based on scanline
+		var color uint16
+		if scanline%2 == 0 {
+			color = color0
+		} else {
+			color = color1
+		}
+
+		// RAW_RUN header
+		buf[ptr] = uint32(COMPOSABLE_RAW_RUN) | (uint32(color) << 16)
+		ptr++
+		buf[ptr] = uint32(width-2) | (uint32(color) << 16)
+		ptr++
+
+		colorPair := uint32(color) | (uint32(color) << 16)
+		for i := 2; i < width; i += 2 {
+			buf[ptr] = colorPair
+			ptr++
+		}
+
+		buf[ptr] = uint32(COMPOSABLE_RAW_1P) | (0 << 16)
+		ptr++
+		buf[ptr] = uint32(COMPOSABLE_EOL_ALIGN) << 16
+
+		return uint16(ptr)
+	}
+
+	// TEST: Use paletteBuf lookup table with fixed byte values
+	if TestPaletteBuf {
+		// Test with byte value 0x00 (all bits 0 = all palette[0])
+		// and 0xFF (all bits 1 = all palette[1])
+		var testByte uint8
+		if scanline%2 == 0 {
+			testByte = 0x00 // All pixels should be palette[0]
+		} else {
+			testByte = 0xFF // All pixels should be palette[1]
+		}
+		colors := paletteBuf[int(testByte)*_8_PIXELS_PER_BYTE:]
+
+		// RAW_RUN header using paletteBuf colors
+		buf[ptr] = uint32(COMPOSABLE_RAW_RUN) | (uint32(colors[0]) << 16)
+		ptr++
+		buf[ptr] = uint32(width-2) | (uint32(colors[1]) << 16)
+		ptr++
+
+		// All 8 pixels from this "byte" should be the same color
+		colorPair := uint32(colors[0]) | (uint32(colors[0]) << 16)
+		for i := 2; i < width; i += 2 {
+			buf[ptr] = colorPair
+			ptr++
+		}
+
+		buf[ptr] = uint32(COMPOSABLE_RAW_1P) | (0 << 16)
+		ptr++
+		buf[ptr] = uint32(COMPOSABLE_EOL_ALIGN) << 16
+
+		return uint16(ptr)
+	}
+
+	// TEST: Render first 8 bytes (64 pixels) from framebuffer, rest solid
+	if TestPartialFramebuffer {
+		idx := scanline * width / _8_PIXELS_PER_BYTE
+		row := g.ShowFrame[idx:]
+
+		// RAW_RUN header with first pixel from byte 0
+		b := row[0]
+		colors := paletteBuf[int(b)*_8_PIXELS_PER_BYTE:]
+
+		buf[ptr] = uint32(COMPOSABLE_RAW_RUN) | (uint32(colors[0]) << 16)
+		ptr++
+		buf[ptr] = uint32(width-2) | (uint32(colors[1]) << 16)
+		ptr++
+
+		// Pixels 2-7 from byte 0
+		buf[ptr] = uint32(colors[2]) | (uint32(colors[3]) << 16)
+		ptr++
+		buf[ptr] = uint32(colors[4]) | (uint32(colors[5]) << 16)
+		ptr++
+		buf[ptr] = uint32(colors[6]) | (uint32(colors[7]) << 16)
+		ptr++
+
+		// Bytes 1-7 (pixels 8-63) from framebuffer
+		for i := 1; i < 8; i++ {
+			b = row[i]
+			colors = paletteBuf[int(b)*_8_PIXELS_PER_BYTE:]
+			buf[ptr] = uint32(colors[0]) | (uint32(colors[1]) << 16)
+			ptr++
+			buf[ptr] = uint32(colors[2]) | (uint32(colors[3]) << 16)
+			ptr++
+			buf[ptr] = uint32(colors[4]) | (uint32(colors[5]) << 16)
+			ptr++
+			buf[ptr] = uint32(colors[6]) | (uint32(colors[7]) << 16)
+			ptr++
+		}
+
+		// Fill remaining pixels (64 to 639) with palette[0] (white)
+		fillColor := uint16(g.Palette[0])
+		colorPair := uint32(fillColor) | (uint32(fillColor) << 16)
+		for i := 64; i < width; i += 2 {
+			buf[ptr] = colorPair
+			ptr++
+		}
+
+		// EOL
+		buf[ptr] = uint32(COMPOSABLE_RAW_1P) | (0 << 16)
+		ptr++
+		buf[ptr] = uint32(COMPOSABLE_EOL_ALIGN) << 16
+
+		return uint16(ptr)
+	}
+
+	// TEST: Read first byte from framebuffer and use it for the whole line
+	if TestFramebuffer {
+		idx := scanline * width / _8_PIXELS_PER_BYTE
+		b := g.ShowFrame[idx] // Read first byte of this scanline
+
+		// Show byte value as color: 0x00 = white, 0xFF = red, other = gradient
+		var color uint16
+		if b == 0x00 {
+			color = uint16(g.Palette[0]) // White
+		} else if b == 0xFF {
+			color = uint16(g.Palette[1]) // Red
+		} else {
+			// Show as gradient based on byte value
+			color = uint16(b) << 2
+		}
+
+		buf[ptr] = uint32(COMPOSABLE_RAW_RUN) | (uint32(color) << 16)
+		ptr++
+		buf[ptr] = uint32(width-2) | (uint32(color) << 16)
+		ptr++
+
+		colorPair := uint32(color) | (uint32(color) << 16)
+		for i := 2; i < width; i += 2 {
+			buf[ptr] = colorPair
+			ptr++
+		}
+
+		buf[ptr] = uint32(COMPOSABLE_RAW_1P) | (0 << 16)
+		ptr++
+		buf[ptr] = uint32(COMPOSABLE_EOL_ALIGN) << 16
+
+		return uint16(ptr)
+	}
+
+	// Original framebuffer-based rendering
 	idx := scanline * width / _8_PIXELS_PER_BYTE
 	row := g.ShowFrame[idx:]
 	cols := width / _8_PIXELS_PER_BYTE
@@ -356,7 +571,7 @@ func (g *GVga) renderScanline1BPP_RawRun(buf []uint32, width, scanline int) uint
 	ci++
 	ptr++
 
-	buf[ptr] = uint32(width - 3)         // push0: low = count
+	buf[ptr] = uint32(width - 2)         // push0: low = count (width-2 for RAW_RUN, matches working scanvideo/minimal)
 	buf[ptr] |= uint32(colors[ci]) << 16 // push1: high = p1
 	ci++
 	ptr++
@@ -380,22 +595,18 @@ func (g *GVga) renderScanline1BPP_RawRun(buf []uint32, width, scanline int) uint
 	ptr++
 	cols--
 
-	// Remaining bytes (8 pixels each)
+	// Remaining bytes (8 pixels each) - use direct indexing to avoid slice overhead
 	for i := 0; i < cols; i++ {
 		b = row[i+1]
-		colors = paletteBuf[int(b)*_8_PIXELS_PER_BYTE:]
+		baseIdx := int(b) << 3 // * 8
 
-		buf[ptr] = uint32(colors[0])
-		buf[ptr] |= uint32(colors[1]) << 16
+		buf[ptr] = uint32(paletteBuf[baseIdx]) | (uint32(paletteBuf[baseIdx+1]) << 16)
 		ptr++
-		buf[ptr] = uint32(colors[2])
-		buf[ptr] |= uint32(colors[3]) << 16
+		buf[ptr] = uint32(paletteBuf[baseIdx+2]) | (uint32(paletteBuf[baseIdx+3]) << 16)
 		ptr++
-		buf[ptr] = uint32(colors[4])
-		buf[ptr] |= uint32(colors[5]) << 16
+		buf[ptr] = uint32(paletteBuf[baseIdx+4]) | (uint32(paletteBuf[baseIdx+5]) << 16)
 		ptr++
-		buf[ptr] = uint32(colors[6])
-		buf[ptr] |= uint32(colors[7]) << 16
+		buf[ptr] = uint32(paletteBuf[baseIdx+6]) | (uint32(paletteBuf[baseIdx+7]) << 16)
 		ptr++
 	}
 
@@ -423,7 +634,7 @@ func (g *GVga) renderScanline2BPP(buf []uint32, width, scanline int) uint16 {
 	// RAW_RUN header
 	buf[ptr] = uint32(COMPOSABLE_RAW_RUN) | (uint32(colors[0]) << 16)
 	ptr++
-	buf[ptr] = uint32(width-3) | (uint32(colors[1]) << 16)
+	buf[ptr] = uint32(width-2) | (uint32(colors[1]) << 16) // width-2 for RAW_RUN (matches working minimal)
 	ptr++
 	buf[ptr] = uint32(colors[2]) | (uint32(colors[3]) << 16)
 	ptr++
@@ -461,7 +672,7 @@ func (g *GVga) renderScanline4BPP(buf []uint32, width, scanline int) uint16 {
 	// RAW_RUN header
 	buf[ptr] = uint32(COMPOSABLE_RAW_RUN) | (uint32(colors[0]) << 16)
 	ptr++
-	buf[ptr] = uint32(width-3) | (uint32(colors[1]) << 16)
+	buf[ptr] = uint32(width-2) | (uint32(colors[1]) << 16) // width-2 for RAW_RUN (matches working minimal)
 	ptr++
 
 	// Remaining bytes
@@ -492,7 +703,7 @@ func (g *GVga) renderScanline8BPP(buf []uint32, width, scanline int) uint16 {
 	// RAW_RUN header
 	buf[ptr] = uint32(COMPOSABLE_RAW_RUN) | (uint32(g.Palette[row[0]]) << 16)
 	ptr++
-	buf[ptr] = uint32(width-3) | (uint32(g.Palette[row[1]]) << 16)
+	buf[ptr] = uint32(width-2) | (uint32(g.Palette[row[1]]) << 16) // width-2 for RAW_RUN (matches working minimal)
 	ptr++
 
 	// Remaining pixels (pairs)
