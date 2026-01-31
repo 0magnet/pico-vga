@@ -1,6 +1,6 @@
 package gvga
 
-import "runtime"
+import "unsafe"
 
 // Graphics primitives for GVga
 
@@ -59,6 +59,12 @@ func (g *GVga) set8bpp(x, y int, pen uint16) {
 
 // Line draws a line from (x0, y0) to (x1, y1) using Bresenham's algorithm
 func (g *GVga) Line(x0, y0, x1, y1 int, pen uint16) {
+	// Use optimized 1bpp path
+	if g.Bits == 1 {
+		g.line1bpp(x0, y0, x1, y1, pen)
+		return
+	}
+
 	dx := abs(x1 - x0)
 	dy := abs(y1 - y0)
 	sx := 1
@@ -73,6 +79,76 @@ func (g *GVga) Line(x0, y0, x1, y1 int, pen uint16) {
 
 	for {
 		g.Set(x0, y0, pen)
+		if x0 == x1 && y0 == y1 {
+			break
+		}
+		e2 := 2 * err
+		if e2 > -dy {
+			err -= dy
+			x0 += sx
+		}
+		if e2 < dx {
+			err += dx
+			y0 += sy
+		}
+	}
+}
+
+// line1bpp is optimized line drawing for 1bpp mode
+func (g *GVga) line1bpp(x0, y0, x1, y1 int, pen uint16) {
+	w := int(g.Width)
+	h := int(g.Height)
+	rowBytes := w / 8
+	frame := g.DrawFrame
+
+	// Clip coordinates
+	if x0 < 0 {
+		x0 = 0
+	}
+	if x0 >= w {
+		x0 = w - 1
+	}
+	if x1 < 0 {
+		x1 = 0
+	}
+	if x1 >= w {
+		x1 = w - 1
+	}
+	if y0 < 0 {
+		y0 = 0
+	}
+	if y0 >= h {
+		y0 = h - 1
+	}
+	if y1 < 0 {
+		y1 = 0
+	}
+	if y1 >= h {
+		y1 = h - 1
+	}
+
+	dx := abs(x1 - x0)
+	dy := abs(y1 - y0)
+	sx := 1
+	if x0 >= x1 {
+		sx = -1
+	}
+	sy := 1
+	if y0 >= y1 {
+		sy = -1
+	}
+	err := dx - dy
+
+	for {
+		// Inline pixel set for 1bpp
+		byteIdx := y0*rowBytes + x0/8
+		mask := uint8(1 << (7 - (x0 & 7)))
+		if pen != 0 {
+			frame[byteIdx] |= mask
+		} else {
+			frame[byteIdx] &^= mask
+		}
+
 		if x0 == x1 && y0 == y1 {
 			break
 		}
@@ -112,12 +188,20 @@ func (g *GVga) Clear(pen uint16) {
 	case 8:
 		fillByte = uint8(pen)
 	}
-	// Clear with periodic yields to let render loop run
-	for i := range g.DrawFrame {
-		g.DrawFrame[i] = fillByte
-		if i%1000 == 0 {
-			runtime.Gosched()
-		}
+
+	// Fast clear using 32-bit writes
+	fillWord := uint32(fillByte) | uint32(fillByte)<<8 | uint32(fillByte)<<16 | uint32(fillByte)<<24
+	frame := g.DrawFrame
+	n := len(frame)
+
+	// Write 4 bytes at a time for most of the buffer
+	i := 0
+	for ; i+4 <= n; i += 4 {
+		*(*uint32)(unsafe.Pointer(&frame[i])) = fillWord
+	}
+	// Handle remaining bytes
+	for ; i < n; i++ {
+		frame[i] = fillByte
 	}
 }
 
