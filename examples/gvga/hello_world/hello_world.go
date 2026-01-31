@@ -1,12 +1,10 @@
 // TinyGo port of GVga hello_world example
 // Matches C version: apps/a0_hello_world/src/main.c
-// Build with: tinygo build -target=pico -scheduler=cores -o hello_world.uf2 .
-// Build with debug: tinygo build -target=pico -scheduler=cores -tags=debug -o hello_world.uf2 .
+// Build with: tinygo build -target=pico -scheduler=tasks -o hello_world.uf2 .
 package main
 
 import (
 	"machine"
-	"runtime"
 	"time"
 
 	"github.com/0magnet/pico-vga/gvga"
@@ -21,25 +19,29 @@ var palette = []gvga.Color{
 }
 
 type helloWorldState struct {
-	width, height int
-	x, y          int
-	dx, dy        int
+	width, height  int
+	x, y           int
+	dx, dy         int
 	color1, color2 uint16
 }
 
 var state helloWorldState
-var freezeAnimation = false
 
 func main() {
-	// Initialize serial (only if debug build)
-	initSerial()
-	debugPrint("GVga hello_world starting...")
-
 	// Initialize LED
 	led := machine.LED
 	led.Configure(machine.PinConfig{Mode: machine.PinOutput})
 
-	// Use 640x480 mode
+	// Startup blink pattern: 3 fast blinks to show program started
+	for i := 0; i < 3; i++ {
+		led.High()
+		time.Sleep(100 * time.Millisecond)
+		led.Low()
+		time.Sleep(100 * time.Millisecond)
+	}
+	time.Sleep(500 * time.Millisecond)
+
+	// Use 640x480 mode (full resolution with multicore)
 	width := 640
 	height := 480
 	bits := 1
@@ -48,12 +50,21 @@ func main() {
 
 	g := gvga.Init(uint16(width), uint16(height), bits, doubleBuffer, interlaced, nil)
 	if g == nil {
+		// Error: rapid blink pattern
 		for {
 			led.Low()
 			time.Sleep(100 * time.Millisecond)
 			led.High()
 			time.Sleep(100 * time.Millisecond)
 		}
+	}
+
+	// Init succeeded: 2 slow blinks
+	for i := 0; i < 2; i++ {
+		led.High()
+		time.Sleep(300 * time.Millisecond)
+		led.Low()
+		time.Sleep(300 * time.Millisecond)
 	}
 
 	g.SetPalette(palette, 0, len(palette))
@@ -66,10 +77,14 @@ func main() {
 
 	// Start video
 	g.Start()
-	g.Sync()
-	g.Sync()
 
-	// Main loop
+	// Start succeeded: 1 long blink
+	led.High()
+	time.Sleep(1000 * time.Millisecond)
+	led.Low()
+	time.Sleep(500 * time.Millisecond)
+
+	// Main loop (matches C version structure)
 	loopCount := 0
 	for {
 		loopCount++
@@ -77,22 +92,10 @@ func main() {
 			led.Set(!led.Get())
 		}
 
-		// Draw content with yields
-		runtime.Gosched()
 		g.Clear(0)
-		runtime.Gosched()
+		moveHelloWorld(&state)
 		drawHelloWorld(g, &state)
-		runtime.Gosched()
-		if !freezeAnimation {
-			moveHelloWorld(&state)
-		}
 		g.Swap(false)
-
-		// Check for serial commands (only if debug build)
-		checkSerialCommands(g, led)
-		printLoopStats(loopCount, g)
-
-		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -126,7 +129,7 @@ func drawHelloWorld(g *gvga.GVga, s *helloWorldState) {
 	color1 := s.color1
 	color2 := s.color2
 
-	// Draw border boxes
+	// Draw border boxes (16 boxes like C version)
 	for i := 1; i < 16; i++ {
 		g.Box(i-1, i-1, width-i, height-i, uint16(i)%g.Colors)
 	}

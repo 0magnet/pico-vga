@@ -4,7 +4,9 @@
 package gvga
 
 import (
+	"runtime"
 	"time"
+	"unsafe"
 
 	"github.com/0magnet/pico-vga/scanvideo"
 )
@@ -159,10 +161,12 @@ func (g *GVga) Start() {
 	}
 	println("gvga.Start: Setup succeeded")
 
-	// Start render loop goroutine BEFORE enabling timing
-	// This allows pre-filling scanline buffers (matches scanvideo_minimal)
+	// Start render loop as a goroutine
+	// With -scheduler=cores (default for pico), this runs on core1 for true parallelism
+	// With -scheduler=tasks, this cooperatively shares CPU with main loop
 	go renderLoopFunc()
-	println("gvga.Start: render loop started")
+	runtime.Gosched() // yield to let render loop start
+	println("gvga.Start: render loop started as goroutine")
 
 	// Sleep to let render loop pre-fill buffers (matches scanvideo_minimal)
 	time.Sleep(50 * time.Millisecond)
@@ -314,7 +318,7 @@ var TestRawPixels = 8
 
 // UseColorRunFor1BPP enables simpler COLOR_RUN rendering instead of RAW_RUN for debugging
 // Set to false to use RAW_RUN (matching C source _scanline_render_1bpp)
-var UseColorRunFor1BPP = false // Use RAW_RUN to show actual pixels
+var UseColorRunFor1BPP = false // Use RAW_RUN
 
 // renderScanline1BPP renders a 1bpp scanline
 // When UseColorRunFor1BPP is true, uses simple COLOR_RUN (for debugging)
@@ -595,31 +599,33 @@ func (g *GVga) renderScanline1BPP_RawRun(buf []uint32, width, scanline int) uint
 	ptr++
 	cols--
 
-	// Remaining bytes (8 pixels each) - use direct indexing to avoid slice overhead
+	// Full rendering using unsafe for speed (no bounds checking)
+	rowPtr := unsafe.Pointer(&row[1])
+	bufPtr := unsafe.Pointer(&buf[ptr])
+	palPtr := unsafe.Pointer(&paletteBuf[0])
+
 	for i := 0; i < cols; i++ {
-		b = row[i+1]
-		baseIdx := int(b) << 3 // * 8
+		b = *(*uint8)(rowPtr)
+		off := uintptr(b) << 3 // * 8
+		p := (*[8]uint16)(unsafe.Add(palPtr, off*2))
 
-		buf[ptr] = uint32(paletteBuf[baseIdx]) | (uint32(paletteBuf[baseIdx+1]) << 16)
-		ptr++
-		buf[ptr] = uint32(paletteBuf[baseIdx+2]) | (uint32(paletteBuf[baseIdx+3]) << 16)
-		ptr++
-		buf[ptr] = uint32(paletteBuf[baseIdx+4]) | (uint32(paletteBuf[baseIdx+5]) << 16)
-		ptr++
-		buf[ptr] = uint32(paletteBuf[baseIdx+6]) | (uint32(paletteBuf[baseIdx+7]) << 16)
-		ptr++
+		*(*uint32)(bufPtr) = uint32(p[0]) | (uint32(p[1]) << 16)
+		*(*uint32)(unsafe.Add(bufPtr, 4)) = uint32(p[2]) | (uint32(p[3]) << 16)
+		*(*uint32)(unsafe.Add(bufPtr, 8)) = uint32(p[4]) | (uint32(p[5]) << 16)
+		*(*uint32)(unsafe.Add(bufPtr, 12)) = uint32(p[6]) | (uint32(p[7]) << 16)
+
+		rowPtr = unsafe.Add(rowPtr, 1)
+		bufPtr = unsafe.Add(bufPtr, 16)
 	}
+	ptr += cols * 4
 
-	// End of line - must end with black pixel (matching C exactly)
-	buf[ptr] = uint32(COMPOSABLE_RAW_1P) // push0: low = RAW_1P
-	buf[ptr] |= 0 << 16                  // push1: high = 0 (black)
+	// End of line
+	buf[ptr] = uint32(COMPOSABLE_RAW_1P)
+	buf[ptr] |= 0 << 16
 	ptr++
-	// push32: high = EOL_ALIGN (for alignment, but this word is NOT sent - C behavior)
-	// Note: C returns _gvga_bufptr which is ptr at this point, NOT ptr+1
-	// The EOL_ALIGN word is written but not included in DataUsed
 	buf[ptr] = uint32(COMPOSABLE_EOL_ALIGN) << 16
 
-	return uint16(ptr) // Match C: return ptr, not ptr+1
+	return uint16(ptr)
 }
 
 // renderScanline2BPP renders a 2bpp scanline (matches C _scanline_render_2bpp)

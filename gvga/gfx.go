@@ -1,5 +1,7 @@
 package gvga
 
+import "runtime"
+
 // Graphics primitives for GVga
 
 // Set sets a single pixel at (x, y) to the given pen color
@@ -110,8 +112,12 @@ func (g *GVga) Clear(pen uint16) {
 	case 8:
 		fillByte = uint8(pen)
 	}
+	// Clear with periodic yields to let render loop run
 	for i := range g.DrawFrame {
 		g.DrawFrame[i] = fillByte
+		if i%1000 == 0 {
+			runtime.Gosched()
+		}
 	}
 }
 
