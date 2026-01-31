@@ -293,3 +293,25 @@ func (g *GVga) Text(x, y int, text string, pen uint16) {
 		x += 8
 	}
 }
+
+// TextAt draws a string at row/column position (for text mode)
+func (g *GVga) TextAt(row, col int, text string, pen uint16) {
+	for _, c := range text {
+		if col >= int(g.Cols) {
+			break
+		}
+		g.CharAt(row, col, uint8(c), pen)
+		col++
+	}
+}
+
+// CharAt draws a character at row/column position (for text mode)
+func (g *GVga) CharAt(row, col int, c uint8, pen uint16) {
+	if row < 0 || row >= int(g.Rows) || col < 0 || col >= int(g.Cols) {
+		return
+	}
+	// Convert row/col to pixel coordinates
+	x := col * 8
+	y := row * 8
+	g.Char(x, y, c, pen)
+}
