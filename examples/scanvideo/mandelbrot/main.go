@@ -14,16 +14,14 @@ import (
 var vgaMode = &scanvideo.Mode320x240_60
 
 const (
-	fracBits = 25
-	maxIters = 127
+	screenWidth  = 320
+	screenHeight = 240
+	fracBits     = 25
+	maxIters     = 127
 )
 
 // Fixed-point type
 type fixed int32
-
-func floatToFixed(x float32) fixed {
-	return fixed(x * float32(1<<fracBits))
-}
 
 func doubleToFixed(x float64) fixed {
 	return fixed(x * float64(1<<fracBits))
@@ -36,16 +34,14 @@ func fixedMult(a, b fixed) fixed {
 
 var (
 	// Mandelbrot params
-	x0, y0    fixed
-	dx0dx     fixed
-	dy0dy     fixed
-	maxMag    fixed
-	frameNum  int
-	y         uint
-	paramsOK  bool
+	x0, y0   fixed
+	dx0dx    fixed
+	dy0dy    fixed
+	maxMag   fixed
+	frameNum int
 
-	// Framebuffer
-	framebuffer [320 * 240]uint16
+	// Framebuffer - 16bpp color
+	framebuffer [screenWidth * screenHeight]uint16
 
 	// Color palette
 	colors = [16]uint16{
@@ -74,8 +70,15 @@ func pxRGB8(r, g, b uint8) uint16 {
 
 func main() {
 	machine.Serial.Configure(machine.UARTConfig{BaudRate: 115200})
-	time.Sleep(100 * time.Millisecond)
-	println("mandelbrot starting...")
+	time.Sleep(500 * time.Millisecond)
+	println("Mandelbrot starting...")
+
+	// Compute first frame before starting video
+	frameUpdateLogic()
+	for y := 0; y < screenHeight; y++ {
+		computeScanline(y)
+	}
+	println("First frame computed")
 
 	if !scanvideo.Setup(vgaMode) {
 		println("Failed to setup video!")
@@ -84,20 +87,29 @@ func main() {
 		}
 	}
 
-	// Initialize mandelbrot params
-	frameUpdateLogic()
+	go renderLoop()
+	time.Sleep(50 * time.Millisecond)
 
 	scanvideo.TimingEnable(true)
-	println("Video started - Mandelbrot zooming...")
+	println("Video started")
 
-	// Start render loop on core1
-	go renderLoop()
+	led := machine.LED
+	led.Configure(machine.PinConfig{Mode: machine.PinOutput})
 
-	// Main loop - compute mandelbrot scanlines
-	go computeLoop()
-
-	// Input loop
+	// Main loop - compute frames with timing
 	for {
+		start := time.Now()
+
+		frameUpdateLogic()
+		for y := 0; y < screenHeight; y++ {
+			computeScanline(y)
+		}
+
+		elapsed := time.Since(start)
+		println("Frame", frameNum-1, ":", elapsed.Milliseconds(), "ms")
+
+		led.Set(!led.Get())
+
 		if machine.Serial.Buffered() > 0 {
 			b, _ := machine.Serial.ReadByte()
 			if b == 'r' {
@@ -106,94 +118,74 @@ func main() {
 				machine.EnterBootloader()
 			}
 		}
-		time.Sleep(10 * time.Millisecond)
 	}
 }
 
-// computeLoop computes mandelbrot scanlines
-func computeLoop() {
-	for {
-		// Check if we need new frame params
-		if y >= uint(vgaMode.Height) {
-			paramsOK = false
-			frameUpdateLogic()
-			y = 0
+// fastMult does 32-bit fixed-point multiply using 16-bit splits
+// Avoids slow 64-bit operations on Cortex-M0
+func fastMult(a, b int32) int32 {
+	// Split into high and low 16-bit parts
+	aH := a >> 16
+	aL := a & 0xFFFF
+	bH := b >> 16
+	bL := b & 0xFFFF
+
+	// Full product = aH*bH*2^32 + (aH*bL + aL*bH)*2^16 + aL*bL
+	// We need >> 25, which is >> 32 then << 7 for high part
+	high := aH * bH
+	mid := aH*bL + aL*bH
+	low := aL * bL
+
+	// Combine: high<<7 + mid>>9 + low>>25
+	return (high << 7) + (mid >> 9) + (low >> 25)
+}
+
+func computeScanline(lineY int) {
+	lineBuffer := framebuffer[lineY*screenWidth:]
+	mx := int32(x0)
+	my := int32(y0) + int32(dy0dy)*int32(lineY)
+	mag := int32(maxMag)
+	dx := int32(dx0dx)
+
+	for x := 0; x < screenWidth; x++ {
+		cr, ci := mx, my
+		zr, zi := cr, ci
+		iters := 0
+
+		for ; iters < maxIters; iters++ {
+			zr2 := fastMult(zr, zr)
+			zi2 := fastMult(zi, zi)
+
+			if zr2+zi2 > mag {
+				break
+			}
+
+			zrzi := fastMult(zr, zi)
+			zr = zr2 - zi2 + cr
+			zi = zrzi<<1 + ci
 		}
 
-		currentY := y
-		y++
-
-		// Compute one scanline
-		computeScanline(currentY)
-	}
-}
-
-func computeScanline(lineY uint) {
-	lineBuffer := framebuffer[lineY*320:]
-	mx := x0
-	my := y0 + fixedMult(dy0dy, fixed(lineY)<<fracBits>>fracBits)
-
-	for x := 0; x < 320; x++ {
-		iters := computePixel(mx, my)
-		if iters == maxIters+1 {
-			lineBuffer[x] = 0
-		} else if iters == maxIters {
+		if iters >= maxIters {
 			lineBuffer[x] = 0
 		} else {
 			lineBuffer[x] = colors[iters&15]
 		}
-		mx += dx0dx
+		mx += dx
 	}
-}
-
-func computePixel(cr, ci fixed) int {
-	zr := cr
-	zi := ci
-	var xold, yold fixed
-	period := 0
-
-	for iters := 0; iters < maxIters; iters++ {
-		zr2 := fixedMult(zr, zr)
-		zi2 := fixedMult(zi, zi)
-
-		if zr2+zi2 > maxMag {
-			return iters
-		}
-
-		zrtemp := zr2 - zi2 + cr
-		zi = 2*fixedMult(zr, zi) + ci
-		zr = zrtemp
-
-		// Period checking for optimization
-		if zr == xold && zi == yold {
-			return maxIters + 1
-		}
-
-		period++
-		if period > 20 {
-			period = 0
-			xold = zr
-			yold = zi
-		}
-	}
-	return maxIters
 }
 
 func frameUpdateLogic() {
-	if !paramsOK {
-		scale := float64(vgaMode.Height) / 2.0
-		offx := float64(min(frameNum, 196)) / 500.0
-		offy := -float64(min(frameNum, 229)) / 250.0
-		scale *= (10000.0 + float64(frameNum)*float64(frameNum)) / 10000.0
-		frameNum++
+	scale := float64(screenHeight) / 2.0
+	offx := float64(min(frameNum, 196)) / 500.0
+	offy := -float64(min(frameNum, 229)) / 250.0
+	scale *= (10000.0 + float64(frameNum)*float64(frameNum)) / 10000.0
+	frameNum++
 
-		x0 = doubleToFixed(offx + float64(-int(vgaMode.Width)/2)/scale - 0.5)
-		y0 = doubleToFixed(offy + float64(-int(vgaMode.Height)/2)/scale)
-		dx0dx = doubleToFixed(1.0 / scale)
-		dy0dy = doubleToFixed(1.0 / scale)
-		maxMag = doubleToFixed(4.0)
-		paramsOK = true
-	}
+	x0 = doubleToFixed(offx + float64(-screenWidth/2)/scale - 0.5)
+	y0 = doubleToFixed(offy + float64(-screenHeight/2)/scale)
+	dx0dx = doubleToFixed(1.0 / scale)
+	dy0dy = doubleToFixed(1.0 / scale)
+	maxMag = doubleToFixed(4.0)
 }
 
 func min(a, b int) int {
@@ -209,37 +201,38 @@ func renderLoop() {
 		if buffer == nil {
 			continue
 		}
-
-		fillScanlineBuffer(buffer)
+		renderScanline(buffer)
 		scanvideo.EndScanlineGeneration(buffer)
 	}
 }
 
-func fillScanlineBuffer(buffer *scanvideo.ScanlineBuffer) {
+// renderScanline - display framebuffer using RAW_RUN
+func renderScanline(buffer *scanvideo.ScanlineBuffer) {
 	lineNum := scanvideo.ScanlineNumber(buffer.ScanlineID)
-	pixels := framebuffer[uint32(lineNum)*320:]
+	width := int(vgaMode.Width)
+	pixels := framebuffer[int(lineNum)*screenWidth:]
 
-	// Use RAW_RUN to output framebuffer pixels
-	idx := 0
+	ptr := 0
 
-	// RAW_RUN: first pixel, count, then pixels
-	buffer.Data[idx] = uint32(scanvideo.COMPOSABLE_RAW_RUN) | (uint32(pixels[0]) << 16)
-	idx++
-	buffer.Data[idx] = uint32(318-2) | (uint32(pixels[1]) << 16) // count = width - 2 - 1
-	idx++
+	// RAW_RUN header: command + first pixel
+	buffer.Data[ptr] = uint32(scanvideo.COMPOSABLE_RAW_RUN) | (uint32(pixels[0]) << 16)
+	ptr++
 
-	// Pack remaining pixels 2 per word
-	for i := 2; i < 320; i += 2 {
-		buffer.Data[idx] = uint32(pixels[i]) | (uint32(pixels[i+1]) << 16)
-		idx++
+	// Word 1: count + second pixel
+	buffer.Data[ptr] = uint32(width-2) | (uint32(pixels[1]) << 16)
+	ptr++
+
+	// Remaining pixels in pairs
+	for i := 2; i < width; i += 2 {
+		buffer.Data[ptr] = uint32(pixels[i]) | (uint32(pixels[i+1]) << 16)
+		ptr++
 	}
 
 	// End of line
-	buffer.Data[idx] = uint32(scanvideo.COMPOSABLE_RAW_1P) | (0 << 16)
-	idx++
-	buffer.Data[idx] = uint32(scanvideo.COMPOSABLE_EOL_SKIP_ALIGN)
-	idx++
+	buffer.Data[ptr] = uint32(scanvideo.COMPOSABLE_RAW_1P) | (0 << 16)
+	ptr++
+	buffer.Data[ptr] = uint32(scanvideo.COMPOSABLE_EOL_ALIGN) << 16
 
-	buffer.DataUsed = uint16(idx)
+	buffer.DataUsed = uint16(ptr)
 	buffer.Status = scanvideo.ScanlineOK
 }
