@@ -6,8 +6,6 @@ package main
 
 import (
 	"machine"
-	"runtime"
-	"sync"
 	"time"
 	"unsafe"
 
@@ -99,35 +97,14 @@ func main() {
 	led := machine.LED
 	led.Configure(machine.PinConfig{Mode: machine.PinOutput})
 
-	// WaitGroup for parallel computation
-	var wg sync.WaitGroup
-
-	// Main loop - compute frames using both cores
+	// Main loop - compute frames (single-core for stability)
 	for {
 		start := time.Now()
 
 		frameUpdateLogic()
-
-		// Split work between two cores: even lines on core0, odd lines on core1
-		wg.Add(2)
-
-		// Core 1: compute odd lines
-		go func() {
-			for y := 1; y < screenHeight; y += 2 {
-				computeScanline(y)
-			}
-			wg.Done()
-		}()
-
-		// Core 0: compute even lines
-		go func() {
-			for y := 0; y < screenHeight; y += 2 {
-				computeScanline(y)
-			}
-			wg.Done()
-		}()
-
-		wg.Wait()
+		for y := 0; y < screenHeight; y++ {
+			computeScanline(y)
+		}
 
 		elapsed := time.Since(start)
 		println("Frame", frameNum-1, ":", elapsed.Milliseconds(), "ms")
@@ -142,7 +119,6 @@ func main() {
 				machine.EnterBootloader()
 			}
 		}
-		runtime.Gosched()
 	}
 }
 
