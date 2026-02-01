@@ -6,7 +6,10 @@ package main
 
 import (
 	"machine"
+	"runtime"
+	"sync"
 	"time"
+	"unsafe"
 
 	"github.com/0magnet/pico-vga/scanvideo"
 )
@@ -96,14 +99,35 @@ func main() {
 	led := machine.LED
 	led.Configure(machine.PinConfig{Mode: machine.PinOutput})
 
-	// Main loop - compute frames with timing
+	// WaitGroup for parallel computation
+	var wg sync.WaitGroup
+
+	// Main loop - compute frames using both cores
 	for {
 		start := time.Now()
 
 		frameUpdateLogic()
-		for y := 0; y < screenHeight; y++ {
-			computeScanline(y)
-		}
+
+		// Split work between two cores: even lines on core0, odd lines on core1
+		wg.Add(2)
+
+		// Core 1: compute odd lines
+		go func() {
+			for y := 1; y < screenHeight; y += 2 {
+				computeScanline(y)
+			}
+			wg.Done()
+		}()
+
+		// Core 0: compute even lines
+		go func() {
+			for y := 0; y < screenHeight; y += 2 {
+				computeScanline(y)
+			}
+			wg.Done()
+		}()
+
+		wg.Wait()
 
 		elapsed := time.Since(start)
 		println("Frame", frameNum-1, ":", elapsed.Milliseconds(), "ms")
@@ -118,6 +142,7 @@ func main() {
 				machine.EnterBootloader()
 			}
 		}
+		runtime.Gosched()
 	}
 }
 
@@ -141,7 +166,8 @@ func fastMult(a, b int32) int32 {
 }
 
 func computeScanline(lineY int) {
-	lineBuffer := framebuffer[lineY*screenWidth:]
+	// Use unsafe pointer to avoid bounds checking
+	linePtr := unsafe.Pointer(&framebuffer[lineY*screenWidth])
 	mx := int32(x0)
 	my := int32(y0) + int32(dy0dy)*int32(lineY)
 	mag := int32(maxMag)
@@ -150,6 +176,8 @@ func computeScanline(lineY int) {
 	for x := 0; x < screenWidth; x++ {
 		cr, ci := mx, my
 		zr, zi := cr, ci
+		var xold, yold int32
+		period := 0
 		iters := 0
 
 		for ; iters < maxIters; iters++ {
@@ -163,13 +191,28 @@ func computeScanline(lineY int) {
 			zrzi := fastMult(zr, zi)
 			zr = zr2 - zi2 + cr
 			zi = zrzi<<1 + ci
+
+			// Period checking - detect cycles (point is in set)
+			if zr == xold && zi == yold {
+				iters = maxIters + 1
+				break
+			}
+			period++
+			if period > 20 {
+				period = 0
+				xold = zr
+				yold = zi
+			}
 		}
 
+		// Write directly via unsafe pointer
+		var color uint16
 		if iters >= maxIters {
-			lineBuffer[x] = 0
+			color = 0
 		} else {
-			lineBuffer[x] = colors[iters&15]
+			color = colors[iters&15]
 		}
+		*(*uint16)(unsafe.Add(linePtr, x*2)) = color
 		mx += dx
 	}
 }
