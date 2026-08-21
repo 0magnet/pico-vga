@@ -64,6 +64,23 @@ main thing to untangle. `BRANCHES.md` records which branch claims what.
 
 ## Licence
 
-Not yet chosen. The referenced C projects carry their own licences
-(pico-extras is BSD-3-Clause); anything derived from them is subject to those
-terms.
+**GPL-3.0** — see [LICENSE](LICENSE).
+
+This follows from the sources rather than from preference:
+
+- `pico-extras` / `pico-playground` are **BSD-3-Clause**, and so is
+  `tinygo-org/pio`. That imposes almost nothing: keep the copyright notice and
+  the disclaimer, don't imply endorsement. It does not restrict what this
+  project may be licensed as.
+- `GVga` is **GPL-3.0**. The `gvga/` package here follows its structure and
+  colour handling closely enough that treating it as covered is the honest
+  reading.
+
+BSD-3-Clause material can be distributed as part of a GPL-3.0 work, so
+GPL-3.0 for the whole repository is the coherent choice while `gvga/` is
+present. If `gvga/` were dropped or independently rewritten, the remainder —
+which follows only BSD-licensed sources — could be released permissively
+instead.
+
+Copyright notices from the upstream projects are retained where their code is
+followed directly.
