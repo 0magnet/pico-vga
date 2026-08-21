@@ -41,12 +41,15 @@ func main() {
 	led.Configure(machine.PinConfig{Mode: machine.PinOutput})
 	println("LED configured")
 
-	// Use 320x240 (working mode with Y-scaling), with double buffering
-	width := 320
-	height := 240
+	// Use 640x480 mode (no Y-scaling, requires faster render loop)
+	width := 640
+	height := 480
 	bits := 1
 	doubleBuffer := true // Enable double buffer to prevent jitter/tearing
 	interlaced := false
+
+	// Disable test mode - use actual RAW_RUN rendering like C gvga
+	gvga.TestSimpleRender = false
 
 	println("Calling gvga.Init...")
 	g := gvga.Init(uint16(width), uint16(height), bits, doubleBuffer, interlaced, nil)
