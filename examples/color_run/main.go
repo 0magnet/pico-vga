@@ -6,6 +6,7 @@ package main
 import (
 	"device/rp"
 	"machine"
+	"runtime/interrupt"
 	"runtime/volatile"
 	"time"
 	"unsafe"
@@ -123,9 +124,158 @@ type dmaChannel struct {
 	CtrlTrig   volatile.Register32
 }
 
+//go:nosplit
 func getDMAChannel(ch int) *dmaChannel {
 	base := uintptr(0x50000000) + uintptr(ch)*0x40
 	return (*dmaChannel)(unsafe.Pointer(base))
+}
+
+// IRQ state variables - matching C scanvideo implementation
+var (
+	irqLine         volatile.Register32 // Current scanline
+	irqFrameCount   volatile.Register32 // Frame counter
+	irqHsyncCount   volatile.Register32 // HSYNC counter
+	irqDisplayBuf   volatile.Register32 // Current display buffer (0 or 1)
+	irqCurrentColor volatile.Register32 // Current solid color
+	irqInstalled    bool
+)
+
+// IRQ scanline buffers - 3 words for COLOR_RUN format
+var irqScanlineBufs [2][3]uint32
+
+// Shared counters for status display (updated by IRQ handlers or polling loop)
+var (
+	hsyncCount     volatile.Register32
+	frameCount     volatile.Register32
+	inVblank       volatile.Register32
+	activeDmaCount volatile.Register32
+	vblankDmaCount volatile.Register32
+	currentColor   volatile.Register32 // Current color for display
+	fifoEmptyCount volatile.Register32
+)
+
+// GPIO sampling for debug
+var (
+	gpioIn      = (*volatile.Register32)(unsafe.Pointer(uintptr(0xd0000004))) // GPIO input register
+	gpioLine0   volatile.Register32
+	gpioLine100 volatile.Register32
+	gpioLine200 volatile.Register32
+	gpioLine300 volatile.Register32
+	gpioLine400 volatile.Register32
+	gpioLine479 volatile.Register32
+)
+
+// COLOR_RUN format: 3 words per scanline
+const colorRunLen = 3
+
+// buildIRQScanline builds a COLOR_RUN scanline buffer
+//
+//go:nosplit
+func buildIRQScanline(buf *[3]uint32) {
+	const MIN_COLOR_RUN = 3
+	color := uint16(irqCurrentColor.Get())
+	buf[0] = uint32(COMPOSABLE_COLOR_RUN) | (uint32(color) << 16)
+	buf[1] = uint32(frameWidth-MIN_COLOR_RUN) | (uint32(COMPOSABLE_RAW_1P) << 16)
+	buf[2] = uint32(color) | (uint32(COMPOSABLE_EOL_ALIGN) << 16) // Last pixel same color
+}
+
+// pioIRQHandler handles PIO IRQ 0 - active/vblank scanline notifications
+// Matches C scanvideo isr_pio0_0() function exactly
+//
+//go:nosplit
+func pioIRQHandler(intr interrupt.Interrupt) {
+	// Read PIO IRQ flags directly (matching C: video_pio->irq)
+	irqReg := &rp.PIO0.IRQ
+	irqFlags := irqReg.Get()
+
+	// IRQ flag 0: Active scanline (C code: if (video_pio->irq & 1u))
+	if irqFlags&1 != 0 {
+		irqReg.Set(1) // Clear flag 0 (C: video_pio->irq = 1)
+		irqHsyncCount.Set(irqHsyncCount.Get() + 1)
+		hsyncCount.Set(irqHsyncCount.Get()) // Copy to shared counter
+		activeDmaCount.Set(activeDmaCount.Get() + 1)
+
+		line := irqLine.Get()
+		if line < frameHeight {
+			// Start DMA for this scanline - use buffer 0 (updated by main loop)
+			dma := getDMAChannel(0)
+			dma.ReadAddr.Set(uint32(uintptr(unsafe.Pointer(&irqScanlineBufs[0][0]))))
+			dma.TransCount.Set(3)
+			dma.CtrlTrig.SetBits(1)
+		}
+		irqLine.Set(line + 1)
+	}
+
+	// IRQ flag 1: Vblank scanline (C code: if (video_pio->irq & 2u))
+	if irqFlags&2 != 0 {
+		irqReg.Set(3) // Clear both flags (C: video_pio->irq = 3)
+		irqHsyncCount.Set(irqHsyncCount.Get() + 1)
+
+		line := irqLine.Get()
+		irqLine.Set(line + 1)
+	}
+
+	// Frame boundary
+	if irqLine.Get() >= vTotal {
+		irqLine.Set(0)
+		irqFrameCount.Set(irqFrameCount.Get() + 1)
+		// Copy to shared counters for status display
+		frameCount.Set(irqFrameCount.Get())
+	}
+}
+
+// pioFIFOHandler handles PIO IRQ 1 - timing FIFO refill
+// Matches C scanvideo isr_pio0_1() function
+//
+//go:nosplit
+func pioFIFOHandler(intr interrupt.Interrupt) {
+	// Refill timing FIFO
+	for !timingSM.IsTxFIFOFull() {
+		timingSM.TxPut(dmaStates[timingState.dmaStateIndex] | timingState.vsyncBits)
+
+		timingState.dmaStateIndex++
+		if timingState.dmaStateIndex >= 4 {
+			timingState.dmaStateIndex = 0
+			timingState.timingScanline++
+
+			if timingState.timingScanline >= timingState.vActive {
+				if timingState.timingScanline >= timingState.vTotal {
+					timingState.timingScanline = 0
+					setupDmaStatesActive()
+				} else if timingState.timingScanline == timingState.vActive {
+					setupDmaStatesVblank()
+				} else if timingState.timingScanline == timingState.vPulseStart {
+					timingState.vsyncBits = timingState.vsyncBitsPulse
+				} else if timingState.timingScanline == timingState.vPulseEnd {
+					timingState.vsyncBits = timingState.vsyncBitsNoPulse
+				}
+			}
+		}
+	}
+}
+
+// installIRQHandlers sets up hardware interrupt handlers matching C scanvideo
+func installIRQHandlers() {
+	if irqInstalled {
+		return
+	}
+
+	// Initialize state
+	irqLine.Set(0)
+	irqFrameCount.Set(0)
+	irqHsyncCount.Set(0)
+	irqDisplayBuf.Set(0)
+
+	// Pre-build scanline buffers
+	buildIRQScanline(&irqScanlineBufs[0])
+	buildIRQScanline(&irqScanlineBufs[1])
+
+	// Install interrupt handler for scanline IRQs only
+	// PIO0_IRQ_0 = IRQ 7 on RP2040
+	// Note: We'll poll for timing FIFO refill in main loop instead of using IRQ1
+	interrupt.New(rp.IRQ_PIO0_IRQ_0, pioIRQHandler).Enable()
+
+	irqInstalled = true
 }
 
 // Animation state
@@ -193,19 +343,8 @@ func main() {
 	// Pre-build first scanline
 	buildScanline(0, &scanlineBufs[0])
 
-	// Counters for frequency measurement (shared with goroutine via volatile)
-	var frameCount volatile.Register32
-	var hsyncCount volatile.Register32
-	var goroutineRunning volatile.Register32
-	var goroutineReady volatile.Register32 // Signal that goroutine is ready
-	var inVblank volatile.Register32 // Set to 1 during vblank, cleared when entering active
-	var activeDmaCount volatile.Register32  // DMA starts during active region
-	var vblankDmaCount volatile.Register32  // DMA starts during vblank
-	var fifoEmptyCount volatile.Register32  // Times FIFO was empty when we checked
-
-	// Using COLOR_RUN format like C scanvideo_minimal - only 3 words per scanline!
-	const MIN_COLOR_RUN = 3
-	println("Using COLOR_RUN format with color cycling")
+	// Using COLOR_RUN format with HARDWARE IRQ handlers (matching C scanvideo)
+	println("Using COLOR_RUN format with HARDWARE IRQ handlers")
 
 	// Color definitions for Pimoroni VGA Demo Base (RGB555: R[4:0] | G[10:6] | B[15:11])
 	const (
@@ -219,134 +358,21 @@ func main() {
 		COLOR_WHITE   = 0xFFDF // R=31, G=31, B=31
 	)
 
-	// Color cycle array
-	colors := []uint16{COLOR_BLACK, COLOR_RED, COLOR_GREEN, COLOR_BLUE, COLOR_YELLOW, COLOR_MAGENTA, COLOR_CYAN, COLOR_WHITE}
-	colorNames := []string{"BLACK", "RED", "GREEN", "BLUE", "YELLOW", "MAGENTA", "CYAN", "WHITE"}
+	// Color cycle array - start with WHITE so we can immediately see if display works
+	colors := []uint16{COLOR_WHITE, COLOR_RED, COLOR_GREEN, COLOR_BLUE, COLOR_YELLOW, COLOR_MAGENTA, COLOR_CYAN, COLOR_BLACK}
+	colorNames := []string{"WHITE", "RED", "GREEN", "BLUE", "YELLOW", "MAGENTA", "CYAN", "BLACK"}
 
-	// Current color (shared with render goroutine)
-	var currentColor volatile.Register32
+	// Set initial color for IRQ handler
+	irqCurrentColor.Set(uint32(colors[0]))
 	currentColor.Set(uint32(colors[0]))
 	var colorIndex int
 
-	// single_color_scanline - exact port of C function from scanvideo_minimal.c
-	single_color_scanline := func(buf []uint32, width int, color16 uint16) int {
-		buf[0] = uint32(COMPOSABLE_COLOR_RUN) | (uint32(color16) << 16)
-		buf[1] = uint32(width-MIN_COLOR_RUN) | (uint32(COMPOSABLE_RAW_1P) << 16)
-		buf[2] = 0 | (uint32(COMPOSABLE_EOL_ALIGN) << 16)
-		return 3
-	}
+	// Initialize both scanline buffers
+	buildIRQScanline(&irqScanlineBufs[0])
+	buildIRQScanline(&irqScanlineBufs[1])
+	println("Using polling mode")
 
-	// Build COLOR_RUN scanline with current color
-	buildColorRunScanline := func(line int, buf []uint32) int {
-		return single_color_scanline(buf, frameWidth, uint16(currentColor.Get()))
-	}
-
-	// Pre-build first scanline using COLOR_RUN
-	colorRunLen := buildColorRunScanline(0, scanlineBufs[0][:])
-
-	// GPIO sampling at strategic lines to track the gradient
-	var gpioLine0 volatile.Register32   // GPIO at line 0 (top)
-	var gpioLine100 volatile.Register32 // GPIO at line 100
-	var gpioLine200 volatile.Register32 // GPIO at line 200
-	var gpioLine300 volatile.Register32 // GPIO at line 300
-	var gpioLine400 volatile.Register32 // GPIO at line 400
-	var gpioLine479 volatile.Register32 // GPIO at line 479 (bottom)
-	gpioIn := (*volatile.Register32)(unsafe.Pointer(uintptr(0xd0000004)))
-
-	// Start render loop BEFORE enabling video (crucial to avoid missing first IRQs)
-	go func() {
-		goroutineRunning.Set(1)
-		goroutineReady.Set(1) // Signal we're ready
-		line := 0
-		displayBuf := 0 // Start with scanlineBufs[0] which was pre-built
-		dataLen := colorRunLen // 3 words for COLOR_RUN
-
-		for {
-			goroutineRunning.Set(goroutineRunning.Get() + 1)
-			// Keep timing FIFO fed
-			topUpTimingFIFO()
-
-			// Check for scanline IRQs (same as hello_world - both if, not else if)
-			irqs := videoPIO.GetIRQ()
-
-			if irqs&1 != 0 {
-				// IRQ 0: Active scanline
-				videoPIO.ClearIRQ(1)
-				hsyncCount.Set(hsyncCount.Get() + 1)
-				inVblank.Set(0)
-				currentRegion.Set(0) // Track we're in active region
-
-				// Sample GPIO at strategic lines
-				switch line {
-				case 0:
-					gpioLine0.Set(gpioIn.Get() & 0xFFFF)
-				case 100:
-					gpioLine100.Set(gpioIn.Get() & 0xFFFF)
-				case 200:
-					gpioLine200.Set(gpioIn.Get() & 0xFFFF)
-				case 300:
-					gpioLine300.Set(gpioIn.Get() & 0xFFFF)
-				case 400:
-					gpioLine400.Set(gpioIn.Get() & 0xFFFF)
-				case 479:
-					gpioLine479.Set(gpioIn.Get() & 0xFFFF)
-				}
-
-				// Transfer scanline data via DMA - only 3 words with COLOR_RUN!
-				if line >= 0 && line < frameHeight {
-					startDMA(unsafe.Pointer(&scanlineBufs[displayBuf][0]), dataLen)
-					activeDmaCount.Set(activeDmaCount.Get() + 1)
-				} else {
-					startDMA(unsafe.Pointer(&blankScanline[0]), blankScanlineLen)
-				}
-
-				// Build next scanline into the other buffer while DMA runs
-				nextLine := line + 1
-				if nextLine >= 0 && nextLine < frameHeight {
-					buildBuf := 1 - displayBuf
-					dataLen = buildColorRunScanline(nextLine, scanlineBufs[buildBuf][:])
-					displayBuf = buildBuf // swap for next iteration
-				}
-
-				line++
-			}
-
-			if irqs&2 != 0 {
-				// IRQ 1: Vblank scanline
-				videoPIO.ClearIRQ(2)
-				hsyncCount.Set(hsyncCount.Get() + 1)
-				inVblank.Set(1)
-				currentRegion.Set(1) // Track we're in vblank region
-
-				// During vblank, send blank scanlines - but skip if DMA busy
-				// This prevents collisions since vblank doesn't need every scanline
-				dma := getDMAChannel(0)
-				if dma.CtrlTrig.Get()&(1<<24) == 0 {
-					// DMA idle - safe to start new transfer
-					startDMA(unsafe.Pointer(&blankScanline[0]), blankScanlineLen)
-					vblankDmaCount.Set(vblankDmaCount.Get() + 1)
-				}
-				// Note: If DMA busy, we skip this vblank line (no collision)
-				line++
-			}
-
-			// Frame boundary
-			if line >= vTotal {
-				line = 0
-				frameCount.Set(frameCount.Get() + 1)
-				// Build scanline 0 for next frame using COLOR_RUN
-				dataLen = buildColorRunScanline(0, scanlineBufs[displayBuf][:])
-			}
-		}
-	}()
-
-	// Wait for goroutine to be ready before enabling video
-	for goroutineReady.Get() == 0 {
-		// Busy wait
-	}
-	println("Render loop ready")
-
-	// NOW enable video - goroutine is ready to handle IRQs
+	// Enable video
 	enableVideo(true)
 	println("Video enabled")
 	println("Press 'r' to reboot to BOOTSEL")
@@ -357,7 +383,38 @@ func main() {
 	lastTime := time.Now()
 	lastStatusFrame := uint32(0)
 
+	// Polling state
+	var pollLine uint32
+
 	for {
+		// Keep timing FIFO fed
+		topUpTimingFIFO()
+
+		// Poll for scanline IRQs (since hardware IRQ is disabled)
+		irqs := videoPIO.GetIRQ()
+		if irqs&1 != 0 {
+			videoPIO.ClearIRQ(1)
+			hsyncCount.Set(hsyncCount.Get() + 1)
+			if pollLine < frameHeight {
+				dma := getDMAChannel(0)
+				dma.ReadAddr.Set(uint32(uintptr(unsafe.Pointer(&irqScanlineBufs[0][0]))))
+				dma.TransCount.Set(3)
+				dma.CtrlTrig.SetBits(1)
+				activeDmaCount.Set(activeDmaCount.Get() + 1)
+			}
+			pollLine++
+		}
+		if irqs&2 != 0 {
+			videoPIO.ClearIRQ(2)
+			hsyncCount.Set(hsyncCount.Get() + 1)
+			vblankDmaCount.Set(vblankDmaCount.Get() + 1)
+			pollLine++
+		}
+		if pollLine >= vTotal {
+			pollLine = 0
+			frameCount.Set(frameCount.Get() + 1)
+		}
+
 		// Check for reboot command (non-blocking)
 		if machine.Serial.Buffered() > 0 {
 			b, _ := machine.Serial.ReadByte()
@@ -375,7 +432,10 @@ func main() {
 		newColorIndex := int(f/60) % len(colors)
 		if newColorIndex != colorIndex {
 			colorIndex = newColorIndex
+			// Update color and rebuild scanline buffer (main loop context, not IRQ)
+			irqCurrentColor.Set(uint32(colors[colorIndex]))
 			currentColor.Set(uint32(colors[colorIndex]))
+			buildIRQScanline(&irqScanlineBufs[0])
 			println("Color:", colorNames[colorIndex], "value:", hex(uint32(colors[colorIndex])))
 		}
 
@@ -427,8 +487,9 @@ func main() {
 			println("GPIO line samples: 0=", hex(g0), "100=", hex(g100), "200=", hex(g200))
 			println("  300=", hex(g300), "400=", hex(g400), "479=", hex(g479))
 
-			// Buffer contents
-			println("Buffer: [0]=", hex(scanlineBufs[0][0]), "[1]=", hex(scanlineBufs[0][1]), "[2]=", hex(scanlineBufs[0][2]))
+			// Buffer contents - show IRQ scanline buffers (used by DMA)
+			println("IRQ buf0: [0]=", hex(irqScanlineBufs[0][0]), "[1]=", hex(irqScanlineBufs[0][1]), "[2]=", hex(irqScanlineBufs[0][2]))
+			println("IRQ buf1: [0]=", hex(irqScanlineBufs[1][0]), "[1]=", hex(irqScanlineBufs[1][1]), "[2]=", hex(irqScanlineBufs[1][2]))
 
 			// All 4 State Machines status
 			println("--- PIO0 State Machines ---")
@@ -471,9 +532,9 @@ func main() {
 			sm3Execctrl := rp.PIO0.SM3_EXECCTRL.Get()
 			println("SM3: PINCTRL=", hex(sm3Pinctrl), "EXECCTRL=", hex(sm3Execctrl))
 
-			// PIO IRQ status
-			pioIrq := videoPIO.GetIRQ()
-			println("PIO IRQ:", hex(uint32(pioIrq)))
+			// PIO IRQ status - check all 8 flags
+			pioIrq := rp.PIO0.IRQ.Get()
+			println("PIO IRQ flags:", hex(pioIrq), "(flag4=", (pioIrq>>4)&1, ")")
 
 			lastHsync = h
 			lastFrame = f
@@ -489,11 +550,15 @@ func initVideo() bool {
 	videoPIO = pio.PIO0
 
 	// Build timing instructions (IRQ instructions executed via out exec)
-	asm := pio.AssemblerV0{}
-	timingInstructions[SET_IRQ_0] = asm.IRQSet(false, 0).Encode()
-	timingInstructions[SET_IRQ_1] = asm.IRQSet(false, 1).Encode()
-	timingInstructions[SET_IRQ_SCANLINE] = asm.IRQSet(false, 4).Encode()
-	timingInstructions[CLEAR_IRQ_SCANLINE] = asm.IRQClear(false, 4).Encode()
+	// NOTE: TinyGo PIO library has a bug - encodeIRQ ignores the irq parameter!
+	// We must manually encode the IRQ instructions.
+	// IRQ instruction format: 1100 0000 00c0 iiii
+	//   c = clear bit (0=set, 1=clear)
+	//   iiii = IRQ index (0-7)
+	timingInstructions[SET_IRQ_0] = 0xC000          // irq set 0
+	timingInstructions[SET_IRQ_1] = 0xC001          // irq set 1
+	timingInstructions[SET_IRQ_SCANLINE] = 0xC004   // irq set 4
+	timingInstructions[CLEAR_IRQ_SCANLINE] = 0xC024 // irq clear 4 (bit 5 = clear)
 
 	// Initialize timing state values
 	initTimingState()
@@ -659,6 +724,11 @@ func initTimingState() {
 	println("  SET_IRQ_1:", hex(uint32(timingInstructions[SET_IRQ_1])))
 	println("  SET_IRQ_SCANLINE:", hex(uint32(timingInstructions[SET_IRQ_SCANLINE])))
 	println("  CLEAR_IRQ_SCANLINE:", hex(uint32(timingInstructions[CLEAR_IRQ_SCANLINE])))
+	// Expected: SET_IRQ_0=0xC000, SET_IRQ_1=0xC001, SET_IRQ_SCANLINE=0xC004, CLEAR_IRQ_SCANLINE=0xC024
+	println("Timing states (full):")
+	println("  a=", hex(timingState.a), "a_vblank=", hex(timingState.aVblank))
+	println("  b1=", hex(timingState.b1), "b2=", hex(timingState.b2))
+	println("  c=", hex(timingState.c), "c_vblank=", hex(timingState.cVblank))
 }
 
 func hex(v uint32) string {
@@ -820,9 +890,13 @@ func enableVideo(enable bool) {
 		sm0TxLevel := (flevel >> 0) & 0xF
 		println("  Scanline FIFO level after pre-fill:", sm0TxLevel)
 
-		// Enable IRQ sources first
-		rp.PIO0.IRQ0_INTE.SetBits(0x03)                  // IRQ 0 and IRQ 1
-		rp.PIO0.IRQ1_INTE.SetBits(1 << (8 + 3))          // SM3 TX not full
+		// Enable IRQ sources - MUST match C scanvideo exactly!
+		// C code uses: pio_set_irq0_source_mask_enabled(pio, (1u << pis_interrupt0) | (1u << pis_interrupt1), true)
+		// pis_interrupt0 = bit 8 (routes IRQ flag 0 to PIO0_IRQ_0)
+		// pis_interrupt1 = bit 9 (routes IRQ flag 1 to PIO0_IRQ_0)
+		// NOT bits 0 and 1!
+		rp.PIO0.IRQ0_INTE.SetBits(0x300)                 // Bits 8,9: route IRQ flags 0,1 to processor
+		// Note: Not using IRQ1 for FIFO - polling in main loop instead
 
 		// Clear any pending IRQs
 		videoPIO.ClearIRQ(0xFF)
