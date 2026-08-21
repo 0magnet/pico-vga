@@ -11,7 +11,7 @@ import (
 	"github.com/0magnet/pico-vga/scanvideo"
 )
 
-var vgaMode = &scanvideo.Mode640x480_60
+var vgaMode = &scanvideo.Mode320x240_60
 
 func main() {
 	// Initialize serial for debug output and reboot

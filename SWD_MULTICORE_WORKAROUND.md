@@ -36,7 +36,7 @@ The magic value `0x05fa0004` writes to AIRCR:
 
 1. **Power cycle**: Unplug and replug the target board after flashing
 2. **BOOTSEL flash**: Use BOOTSEL mode to flash UF2 files instead of SWD
-3. **Single-core mode**: Use `-scheduler=tasks` if multicore isn't required
+3. **Single-core mode**: Use `-scheduler=tasks` if multicore isn't required (it is required, don't use that)
 
 ## Flash Helper Command
 
