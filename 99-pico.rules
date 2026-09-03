@@ -1,0 +1,13 @@
+# Raspberry Pi Pico udev rules
+# Pico in normal mode (USB serial)
+SUBSYSTEM=="usb", ATTRS{idVendor}=="2e8a", ATTRS{idProduct}=="000a", MODE="0666", GROUP="wheel"
+SUBSYSTEM=="tty", ATTRS{idVendor}=="2e8a", ATTRS{idProduct}=="000a", MODE="0666", GROUP="wheel"
+
+# Pico in BOOTSEL mode (RP2040)
+SUBSYSTEM=="usb", ATTRS{idVendor}=="2e8a", ATTRS{idProduct}=="0003", MODE="0666", GROUP="wheel"
+
+# RP2040 Boot
+SUBSYSTEM=="usb", ATTRS{idVendor}=="2e8a", ATTRS{idProduct}=="0005", MODE="0666", GROUP="wheel"
+
+# Generic RP2040/RP2350 BOOTSEL
+SUBSYSTEM=="usb", ATTRS{idVendor}=="2e8a", MODE="0666", GROUP="wheel"

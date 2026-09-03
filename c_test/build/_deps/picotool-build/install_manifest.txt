@@ -1,0 +1,7 @@
+/home/d0mo/go/src/github.com/0magnet/pico-vga/c_test/build/_deps/picotool/picotool
+/home/d0mo/go/src/github.com/0magnet/pico-vga/c_test/build/_deps/picotool/picotoolTargets.cmake
+/home/d0mo/go/src/github.com/0magnet/pico-vga/c_test/build/_deps/picotool/picotoolTargets-release.cmake
+/home/d0mo/go/src/github.com/0magnet/pico-vga/c_test/build/_deps/picotool/picotoolConfig.cmake
+/home/d0mo/go/src/github.com/0magnet/pico-vga/c_test/build/_deps/picotool/picotoolConfigVersion.cmake
+/home/d0mo/go/src/github.com/0magnet/pico-vga/c_test/build/_deps/picotool/enc_bootloader.elf
+/home/d0mo/go/src/github.com/0magnet/pico-vga/c_test/build/_deps/picotool/enc_bootloader_mbedtls.elf
