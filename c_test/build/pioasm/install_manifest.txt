@@ -1,5 +1,0 @@
-/home/d0mo/go/src/github.com/0magnet/pico-vga/c_test/build/pioasm-install/pioasm/pioasm
-/home/d0mo/go/src/github.com/0magnet/pico-vga/c_test/build/pioasm-install/pioasm/pioasmTargets.cmake
-/home/d0mo/go/src/github.com/0magnet/pico-vga/c_test/build/pioasm-install/pioasm/pioasmTargets-release.cmake
-/home/d0mo/go/src/github.com/0magnet/pico-vga/c_test/build/pioasm-install/pioasm/pioasmConfig.cmake
-/home/d0mo/go/src/github.com/0magnet/pico-vga/c_test/build/pioasm-install/pioasm/pioasmConfigVersion.cmake

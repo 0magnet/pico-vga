@@ -1,7 +1,0 @@
-{
-	"InstallScripts" : 
-	[
-		"/home/d0mo/go/src/github.com/0magnet/pico-vga/c_test/build/pioasm/cmake_install.cmake"
-	],
-	"Parallel" : false
-}

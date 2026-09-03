@@ -1,2 +1,0 @@
-/home/d0mo/go/src/github.com/0magnet/pico-vga/c_test/build/_deps/picotool-build/enc_bootloader_mbedtls/CMakeFiles/edit_cache.dir
-/home/d0mo/go/src/github.com/0magnet/pico-vga/c_test/build/_deps/picotool-build/enc_bootloader_mbedtls/CMakeFiles/rebuild_cache.dir

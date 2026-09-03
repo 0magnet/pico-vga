@@ -1,7 +1,0 @@
-/home/d0mo/go/src/github.com/0magnet/pico-vga/c_test/build/pioasm/CMakeFiles/pioasm.dir
-/home/d0mo/go/src/github.com/0magnet/pico-vga/c_test/build/pioasm/CMakeFiles/edit_cache.dir
-/home/d0mo/go/src/github.com/0magnet/pico-vga/c_test/build/pioasm/CMakeFiles/rebuild_cache.dir
-/home/d0mo/go/src/github.com/0magnet/pico-vga/c_test/build/pioasm/CMakeFiles/list_install_components.dir
-/home/d0mo/go/src/github.com/0magnet/pico-vga/c_test/build/pioasm/CMakeFiles/install.dir
-/home/d0mo/go/src/github.com/0magnet/pico-vga/c_test/build/pioasm/CMakeFiles/install/local.dir
-/home/d0mo/go/src/github.com/0magnet/pico-vga/c_test/build/pioasm/CMakeFiles/install/strip.dir
