@@ -1,0 +1,288 @@
+// VGA Driver for Pimoroni Pico VGA Demo Base
+// Generates proper VESA 640x480@60Hz VGA signal
+//
+// Pimoroni VGA Board pinout:
+//   GPIO 0-15: RGB color (16-bit)
+//   GPIO 16:   HSYNC
+//   GPIO 17:   VSYNC
+//
+// VGA 640x480 @ 60Hz timing (25MHz pixel clock):
+//   Horizontal: 800 total cycles per line
+//     - Active:      640 cycles
+//     - Front porch: 16 cycles
+//     - Sync pulse:  96 cycles (LOW - negative polarity)
+//     - Back porch:  48 cycles
+//   Vertical: 525 total lines per frame
+//     - Active:      480 lines
+//     - Front porch: 10 lines
+//     - Sync pulse:  2 lines (LOW - negative polarity)
+//     - Back porch:  33 lines
+
+package main
+
+import (
+	"machine"
+	"time"
+
+	pio "github.com/tinygo-org/pio/rp2-pio"
+)
+
+const (
+	pinHSYNC    = machine.GPIO16
+	pinVSYNC    = machine.GPIO17
+	pinRGBBase  = machine.GPIO0
+	numRGBPins  = 16
+
+	// VGA timing constants (for 25MHz clock)
+	// HSYNC timing
+	hActive      = 640
+	hFrontPorch  = 16
+	hSyncPulse   = 96
+	hBackPorch   = 48
+	hTotal       = 800 // 640 + 16 + 96 + 48
+
+	// VSYNC timing
+	vActive      = 480
+	vFrontPorch  = 10
+	vSyncPulse   = 2
+	vBackPorch   = 33
+	vTotal       = 525 // 480 + 10 + 2 + 33
+
+	// Values to load into PIO state machines
+	// Loop needs 656 cycles for active+frontporch. With set(1) + mov(1) + loop(N), N = 654
+	// jmp x-- loops (value+1) times, so value = 653
+	hActiveFP  = 653 // Loop value: set(1) + mov(1) + loop(654) = 656 cycles
+	vActiveVal = vActive - 1 // 479 - counter value for active lines
+)
+
+func main() {
+	// Configure LED for visual feedback
+	led := machine.LED
+	led.Configure(machine.PinConfig{Mode: machine.PinOutput})
+	led.High()
+
+	time.Sleep(2 * time.Second) // Allow USB serial to connect
+	println("TinyGo VGA Driver starting...")
+	println("Target: VESA 640x480@60Hz, negative sync polarity")
+
+	// Blink LED 3 times to show we're alive
+	for i := 0; i < 3; i++ {
+		led.Low()
+		time.Sleep(100 * time.Millisecond)
+		led.High()
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	// Configure RGB pins (GPIO 0-15) as outputs, set to LOW (black)
+	for pin := pinRGBBase; pin < pinRGBBase+numRGBPins; pin++ {
+		pin.Configure(machine.PinConfig{Mode: machine.PinOutput})
+		pin.Low()
+	}
+	println("RGB pins configured (black)")
+
+	// Initialize sync pins HIGH (idle state for negative polarity)
+	pinHSYNC.Configure(machine.PinConfig{Mode: machine.PinOutput})
+	pinHSYNC.High()
+	pinVSYNC.Configure(machine.PinConfig{Mode: machine.PinOutput})
+	pinVSYNC.High()
+	println("Sync pins initialized HIGH (idle)")
+
+	Pio := pio.PIO0
+
+	// --- HSYNC State Machine ---
+	hsyncSM := Pio.StateMachine(0)
+	hsyncSM.TryClaim()
+
+	hsyncOffset, err := Pio.AddProgram(hsyncProgram[:], -1)
+	if err != nil {
+		println("Failed to load HSYNC program:", err.Error())
+		panic(err)
+	}
+	println("HSYNC program loaded at offset", hsyncOffset)
+
+	// Configure HSYNC
+	hsyncCfg := hsyncDefaultConfig(hsyncOffset)
+	hsyncCfg.SetSetPins(pinHSYNC, 1)
+	hsyncCfg.SetClkDivIntFrac(4, 247) // 125MHz / 4.965 ≈ 25.175MHz (standard VGA)
+
+	pinHSYNC.Configure(machine.PinConfig{Mode: Pio.PinMode()})
+	hsyncSM.SetPindirsConsecutive(pinHSYNC, 1, true)
+	hsyncSM.Init(hsyncOffset, hsyncCfg)
+
+	// --- VSYNC State Machine ---
+	vsyncSM := Pio.StateMachine(1)
+	vsyncSM.TryClaim()
+
+	vsyncOffset, err := Pio.AddProgram(vsyncProgram[:], -1)
+	if err != nil {
+		println("Failed to load VSYNC program:", err.Error())
+		panic(err)
+	}
+	println("VSYNC program loaded at offset", vsyncOffset)
+
+	// Configure VSYNC
+	vsyncCfg := vsyncDefaultConfig(vsyncOffset)
+	vsyncCfg.SetSetPins(pinVSYNC, 1)
+	vsyncCfg.SetSidesetPins(pinVSYNC)
+	vsyncCfg.SetClkDivIntFrac(4, 247) // 125MHz / 4.965 ≈ 25.175MHz (standard VGA)
+
+	pinVSYNC.Configure(machine.PinConfig{Mode: Pio.PinMode()})
+	vsyncSM.SetPindirsConsecutive(pinVSYNC, 1, true)
+	vsyncSM.Init(vsyncOffset, vsyncCfg)
+
+	// Send timing parameters to FIFOs before starting
+	hsyncSM.TxPut(uint32(hActiveFP))  // 653 for loop counter
+	vsyncSM.TxPut(uint32(vActiveVal)) // 479 for active lines
+
+	// Start both state machines simultaneously
+	hsyncSM.SetEnabled(true)
+	vsyncSM.SetEnabled(true)
+
+	println("VGA sync signals running!")
+	println("Monitor should display a black screen with valid sync.")
+
+	// Keep running - blink LED to show we're alive
+	ledState := true
+	for {
+		if ledState {
+			led.High()
+		} else {
+			led.Low()
+		}
+		ledState = !ledState
+		time.Sleep(500 * time.Millisecond)
+	}
+}
+
+// Helper functions for encoding PIO instructions
+
+func encodeDelay(instr uint16, cycles uint8) uint16 {
+	return instr | (uint16(cycles&0x1f) << 8)
+}
+
+func encodeSideset(instr uint16, bitCount, value uint8) uint16 {
+	return instr | (uint16(value) << (13 - bitCount))
+}
+
+// Manual IRQ encoding (v0.2.0 has bug in encodeIRQ)
+func encodeIRQSet(irq uint8) uint16 {
+	return 0xc000 | uint16(irq&0x1f)
+}
+
+func encodeWaitIRQ(polarity bool, irq uint8) uint16 {
+	pol := uint16(0)
+	if polarity {
+		pol = 1 << 7
+	}
+	return 0x2000 | pol | (2 << 5) | uint16(irq&0x1f)
+}
+
+// HSYNC PIO program - Negative polarity (idle HIGH, pulse LOW)
+// Generates horizontal sync at 25MHz
+// Timing: Active+FP(656 HIGH) -> Sync(96 LOW) -> BP(48 HIGH)
+// Fires IRQ 0 at end of each line
+var hsyncProgram = [...]uint16{
+	// 0: pull block - Pull timing value from FIFO (once)
+	pio.EncodePull(false, true),
+
+	// .wrap_target (instruction 1)
+	// 1: set pins, 1 - Keep HSYNC HIGH during active+frontporch
+	pio.EncodeSet(pio.SrcDestPins, 1),
+
+	// 2: mov x, osr - Copy timing value to X
+	pio.EncodeMov(pio.SrcDestX, pio.SrcDestOSR),
+
+	// activeporch: (instruction 3)
+	// 3: jmp x-- activeporch - Count down active + frontporch cycles
+	pio.EncodeJmp(3, pio.JmpXNZeroDec),
+
+	// SYNC PULSE (96 cycles total, LOW - negative polarity)
+	// 4: set pins, 0 [31] - 32 cycles low
+	encodeDelay(pio.EncodeSet(pio.SrcDestPins, 0), 31),
+	// 5: set pins, 0 [31] - 64 cycles low
+	encodeDelay(pio.EncodeSet(pio.SrcDestPins, 0), 31),
+	// 6: set pins, 0 [31] - 96 cycles low
+	encodeDelay(pio.EncodeSet(pio.SrcDestPins, 0), 31),
+
+	// BACKPORCH (48 cycles total, HIGH)
+	// 7: set pins, 1 [31] - 32 cycles high
+	encodeDelay(pio.EncodeSet(pio.SrcDestPins, 1), 31),
+	// 8: set pins, 1 [14] - 15 cycles high (1 + 14 delay)
+	encodeDelay(pio.EncodeSet(pio.SrcDestPins, 1), 14),
+	// 9: irq 0 - 1 cycle, total backporch = 32 + 15 + 1 = 48
+	encodeIRQSet(0),
+	// .wrap (wraps back to instruction 1)
+}
+
+const hsyncWrapTarget = 1
+const hsyncWrap = 9
+
+func hsyncDefaultConfig(offset uint8) pio.StateMachineConfig {
+	cfg := pio.DefaultStateMachineConfig()
+	cfg.SetWrap(offset+hsyncWrapTarget, offset+hsyncWrap)
+	return cfg
+}
+
+// VSYNC PIO program - Negative polarity (idle HIGH, pulse LOW)
+// Generates vertical sync, synchronized to HSYNC via IRQ 0
+// Fires IRQ 1 during active video area
+var vsyncProgram = [...]uint16{
+	// 0: pull block - Pull timing value from FIFO (once)
+	pio.EncodePull(false, true),
+
+	// .wrap_target (instruction 1)
+	// ACTIVE (480 lines) - VSYNC stays HIGH
+	// 1: set pins, 1 - Ensure VSYNC is HIGH
+	pio.EncodeSet(pio.SrcDestPins, 1),
+
+	// 2: mov x, osr - Copy line count to X
+	pio.EncodeMov(pio.SrcDestX, pio.SrcDestOSR),
+
+	// activefront:
+	// 3: wait 1 irq 0 - Wait for HSYNC end-of-line
+	encodeWaitIRQ(true, 0),
+	// 4: irq 1 - Signal active video (for RGB state machine)
+	encodeIRQSet(1),
+	// 5: jmp x-- activefront - Count down active lines
+	pio.EncodeJmp(3, pio.JmpXNZeroDec),
+
+	// FRONTPORCH (10 lines) - VSYNC stays HIGH
+	// 6: set y, 9 - 10 lines (0-9)
+	pio.EncodeSet(pio.SrcDestY, 9),
+	// frontporch:
+	// 7: wait 1 irq 0
+	encodeWaitIRQ(true, 0),
+	// 8: jmp y-- frontporch
+	pio.EncodeJmp(7, pio.JmpYNZeroDec),
+
+	// SYNC PULSE (2 lines, LOW - negative polarity)
+	// 9: set pins, 0 - VSYNC LOW
+	pio.EncodeSet(pio.SrcDestPins, 0),
+	// 10: wait 1 irq 0 - First sync line
+	encodeWaitIRQ(true, 0),
+	// 11: wait 1 irq 0 - Second sync line
+	encodeWaitIRQ(true, 0),
+
+	// BACKPORCH (33 lines) - VSYNC HIGH
+	// 12: set pins, 1 - VSYNC HIGH
+	pio.EncodeSet(pio.SrcDestPins, 1),
+	// 13: set y, 31 - 32 lines
+	pio.EncodeSet(pio.SrcDestY, 31),
+	// backporch:
+	// 14: wait 1 irq 0
+	encodeWaitIRQ(true, 0),
+	// 15: jmp y-- backporch
+	pio.EncodeJmp(14, pio.JmpYNZeroDec),
+	// 16: wait 1 irq 0 - 33rd line (wrap will handle transition)
+	encodeWaitIRQ(true, 0),
+	// .wrap (wraps back to instruction 1)
+}
+
+const vsyncWrapTarget = 1
+const vsyncWrap = 16
+
+func vsyncDefaultConfig(offset uint8) pio.StateMachineConfig {
+	cfg := pio.DefaultStateMachineConfig()
+	cfg.SetWrap(offset+vsyncWrapTarget, offset+vsyncWrap)
+	return cfg
+}
