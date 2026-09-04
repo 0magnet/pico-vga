@@ -84,3 +84,36 @@ instead.
 
 Copyright notices from the upstream projects are retained where their code is
 followed directly.
+
+## Dependency Graph
+
+Made with [goda](https://github.com/loov/goda):
+
+```
+go run github.com/loov/goda@latest graph github.com/0magnet/pico-vga/... | dot -Tsvg -o docs/pico-vga-goda-graph.svg
+```
+
+![Dependency Graph](docs/pico-vga-goda-graph.svg "github.com/0magnet/pico-vga Dependency Graph")
+
+## Lines of Code
+
+Made with [gocloc](https://github.com/hhatto/gocloc) (excludes `vendor/`, `node_modules/`, `.git/`):
+
+```
+gocloc --not-match-d='(vendor|node_modules|\.git)' .
+```
+
+```
+-------------------------------------------------------------------------------
+Language                     files          blank        comment           code
+-------------------------------------------------------------------------------
+Go                              35           1227           1408           6227
+Markdown                         6            405              0           1345
+C                                1             40             10            133
+YAML                             1              0             10            102
+CMake                            1              7              3             19
+BASH                             1              6              6             16
+-------------------------------------------------------------------------------
+TOTAL                           45           1685           1437           7842
+-------------------------------------------------------------------------------
+```
