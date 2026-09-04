@@ -26,7 +26,7 @@ The two dropped copies contained nothing that is not reachable from `main`.
 |---|---|
 | `main` | newest trunk, plus this file and the README |
 | `mainframe-bak` | **the interesting one** — 14 commits the trunk does not have |
-| `mainframe-bak1` | one unique commit: black-line fix + colour cycling in `color_run` |
+| `mainframe-bak1` | one unique commit: black-line fix + color cycling in `color_run` |
 | `node` | one unique commit: 1BPP renderer cleanup, larger 640x480 scanline buffers |
 | `*-wip` | uncommitted edits found in that copy, as one commit on top |
 

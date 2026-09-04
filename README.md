@@ -33,12 +33,12 @@ two can be compared side by side:
   live in [pico-playground](https://github.com/raspberrypi/pico-playground).
 - **[GVga](https://github.com/drfrancintosh/GVga)** by drfrancintosh — a
   graphics library layered over scanvideo. The `gvga/` package follows its
-  colour modes and framebuffer handling.
+  color modes and framebuffer handling.
 
 Both are C and both are the reference for what correct output looks like. Some
 branches carry compiled `.uf2` images of the original C examples under
 `c_examples/`, kept purely so the Go output can be diffed against known-good
-hardware behaviour.
+hardware behavior.
 
 Credit for the underlying technique belongs to those projects; the bugs here
 are mine.
@@ -73,7 +73,7 @@ This follows from the sources rather than from preference:
   the disclaimer, don't imply endorsement. It does not restrict what this
   project may be licensed as.
 - `GVga` is **GPL-3.0**. The `gvga/` package here follows its structure and
-  colour handling closely enough that treating it as covered is the honest
+  color handling closely enough that treating it as covered is the honest
   reading.
 
 BSD-3-Clause material can be distributed as part of a GPL-3.0 work, so
