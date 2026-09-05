@@ -62,7 +62,7 @@ is not necessarily the one that produces the best picture — at one point a
 working multi-core path was reverted to a stable single-core one. That is the
 main thing to untangle. `BRANCHES.md` records which branch claims what.
 
-## Licence
+## License
 
 **GPL-3.0** — see [LICENSE](LICENSE).
 

@@ -224,7 +224,7 @@ func main() {
 	}
 
 	// Build COLOR_RUN scanline with line-based color (like C example)
-	// C uses: bgcolour = (uint16_t) l << 2
+	// C uses: bgcolor = (uint16_t) l << 2
 	buildColorRunScanline := func(line int, buf []uint32) int {
 		// For solid color test, use constant WHITE
 		// To match C gradient: color16 := uint16(line << 2)

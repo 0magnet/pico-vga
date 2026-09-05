@@ -570,8 +570,8 @@ picotool load /home/d0mo/go/src/github.com/raspberrypi/pico-playground/build/sca
 
 void render_scanline(struct scanvideo_scanline_buffer *dest, int core) {
     int l = scanvideo_scanline_number(dest->scanline_id);
-    uint16_t bgcolour = (uint16_t) l << 2;  // Color based on line number
-    dest->data_used = single_color_scanline(buf, buf_length, VGA_MODE.width, bgcolour);
+    uint16_t bgcolor = (uint16_t) l << 2;  // Color based on line number
+    dest->data_used = single_color_scanline(buf, buf_length, VGA_MODE.width, bgcolor);
 }
 ```
 
